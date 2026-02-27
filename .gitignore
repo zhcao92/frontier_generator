@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints
+
+# Model checkpoints (exclude all trained models)
+*.pt
+*.pth
+*.ckpt
+*.weights
+
+# Data directories (exclude all TIAMAT datasets)
+set2/
+set6/
+final_set1/
+final_issac_baseline/
+habitat_set1/
+**/DARPA_TIAMAT/
+**/frontiers/
+**/waypoints/
+**/atlas.pkl
+
+# Cache directories
+gain_cache/
+detr_cache/
+*_cache/
+*.pkl
+*.npz
+*.npy
+
+# Output directories
+results/
+predict_*/
+vis_*/
+
+# Documentation (internal notes)
+docs/
+
+# Logs
+*.log
+*.out
+*.err
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Keep example images (if you add a examples/ directory)
+!examples/**/*.png
+!examples/**/*.jpg
