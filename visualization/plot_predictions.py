@@ -574,12 +574,17 @@ def plot_summary_map_generation(frontier_id, frontier_data, output_folder,
                            zorder=1, marker='s', linewidths=0)
 
     # Neighborhood WPs + edges
+    # Only consider WPs that are in waypoint_ids (not all WPs in global atlas)
+    waypoint_ids_set = set(waypoint_ids)
     neighborhood_wps = set()
     for ref_wp in waypoint_ids:
         if ref_wp not in _WP_POSITIONS:
             continue
         ox, oy = _WP_POSITIONS[ref_wp][0], _WP_POSITIONS[ref_wp][1]
-        for wp_id, pos in _WP_POSITIONS.items():
+        for wp_id in waypoint_ids_set:  # Only check WPs in this map
+            if wp_id not in _WP_POSITIONS:
+                continue
+            pos = _WP_POSITIONS[wp_id]
             dx, dy = pos[0] - ox, pos[1] - oy
             if dx * dx + dy * dy <= NEIGHBORHOOD_RADIUS ** 2:
                 neighborhood_wps.add(wp_id)
@@ -721,12 +726,17 @@ def plot_summary_map_gain_generation(frontier_id, frontier_data, output_folder,
                            zorder=1, marker='s', linewidths=0)
 
     # WP graph edges + dots
+    # Only consider WPs that are in waypoint_ids (not all WPs in global atlas)
+    waypoint_ids_set = set(waypoint_ids)
     neighborhood_wps = set()
     for ref_wp in waypoint_ids:
         if ref_wp not in _WP_POSITIONS:
             continue
         ox, oy = _WP_POSITIONS[ref_wp][0], _WP_POSITIONS[ref_wp][1]
-        for wp_id, pos in _WP_POSITIONS.items():
+        for wp_id in waypoint_ids_set:  # Only check WPs in this map
+            if wp_id not in _WP_POSITIONS:
+                continue
+            pos = _WP_POSITIONS[wp_id]
             dx, dy = pos[0] - ox, pos[1] - oy
             if dx * dx + dy * dy <= NEIGHBORHOOD_RADIUS ** 2:
                 neighborhood_wps.add(wp_id)
@@ -961,12 +971,17 @@ def plot_summary_map(frontier_id, frontier_data, output_folder,
                                zorder=1, marker='s', linewidths=0)
 
     # Layer 1 — Local atlas neighborhood WPs (within 5m of each JSON WP)
+    # Only consider WPs that are in waypoint_ids (not all WPs in global atlas)
+    waypoint_ids_set = set(waypoint_ids)
     neighborhood_wps = set()
     for ref_wp in waypoint_ids:
         if ref_wp not in _WP_POSITIONS:
             continue
         ox, oy = _WP_POSITIONS[ref_wp][0], _WP_POSITIONS[ref_wp][1]
-        for wp_id, pos in _WP_POSITIONS.items():
+        for wp_id in waypoint_ids_set:  # Only check WPs in this map
+            if wp_id not in _WP_POSITIONS:
+                continue
+            pos = _WP_POSITIONS[wp_id]
             dx, dy = pos[0] - ox, pos[1] - oy
             if dx * dx + dy * dy <= NEIGHBORHOOD_RADIUS ** 2:
                 neighborhood_wps.add(wp_id)
