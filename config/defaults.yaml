@@ -19,21 +19,13 @@ refinement:
   add_gain_thresh:    0.0
   kappa:              5.0
   q_min:              0.2
-
-v2:
-  delta_drop:     1.0
-  delta_keep:     1.0
-  delta_add:      5.0
-  max_add_per_wp: 2
-  eta:            0.0
-
-v3:
+  # Set-cover algorithm parameters
   coverage_frac:      0.65
   shift_radius_cells: 5
   wall_margin_cells:  3
   proximity_disq_m:   2.0
 
 training:
-  few_epochs:  10  # Changed from 50 to 10 for quick testing
+  few_epochs:  50  # Full training epochs
   finetune_lr: 1.0e-5
   n_rounds:    3

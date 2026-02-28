@@ -9,7 +9,6 @@ export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
 # Source path config (edit config/env.sh for your machine)
 source "${PROJECT_ROOT}/config/env.sh"
 
-REFINE_METHOD="${REFINE_METHOD:-v3}"
 ROUNDS=1
 OUT_DIR=results/${FRONTIER_ID}_nofinetune
 
@@ -19,8 +18,7 @@ python3 self_training/self_supervised_refine.py \
     --gain-checkpoint "${GAIN_CHECKPOINT}" \
     --rounds ${ROUNDS} \
     --out-dir "${OUT_DIR}" \
-    --no-finetune \
-    --refine-method "${REFINE_METHOD}"
+    --no-finetune
 
 python3 visualization/plot_refinement.py \
     --frontier-id "${FRONTIER_ID}" \
