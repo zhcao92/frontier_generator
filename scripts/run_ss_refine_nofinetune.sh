@@ -1,31 +1,28 @@
 #!/bin/bash
+# Inference-only run (no DETR fine-tuning) + visualization.
 
-# Get the directory where this script is located
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-# Get the project root (one level up from scripts/)
 PROJECT_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
-
-# Change to project root to ensure correct imports
 cd "$PROJECT_ROOT"
-
-# Add project root to PYTHONPATH so imports work correctly
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH}"
 
-export TIAMAT_DATA_DIR=/scratch/mcity_project_root/mcity_project/shared_data/DARPA_TIAMAT/frontier_generator/set2
+# Source path config (edit config/env.sh for your machine)
+source "${PROJECT_ROOT}/config/env.sh"
 
-FRONTIER_ID=7000
+REFINE_METHOD="${REFINE_METHOD:-v3}"
 ROUNDS=1
 OUT_DIR=results/${FRONTIER_ID}_nofinetune
 
 python3 self_training/self_supervised_refine.py \
-    --frontier-id ${FRONTIER_ID} \
-    --detr-checkpoint /scratch/mcity_project_root/mcity_project/zhcao/DARPA_TIAMAT/detr_cache/model_best.pt \
-    --gain-checkpoint /home/zhcao/CodesLib/TIAMAT/frontier_predictor/gain_cache/model_final.pt \
+    --frontier-id "${FRONTIER_ID}" \
+    --detr-checkpoint "${DETR_CHECKPOINT}" \
+    --gain-checkpoint "${GAIN_CHECKPOINT}" \
     --rounds ${ROUNDS} \
-    --out-dir ${OUT_DIR} \
-    --no-finetune
+    --out-dir "${OUT_DIR}" \
+    --no-finetune \
+    --refine-method "${REFINE_METHOD}"
 
 python3 visualization/plot_refinement.py \
-    --frontier-id ${FRONTIER_ID} \
-    --json ${OUT_DIR}/refined_round1.json \
-    --out-dir ${OUT_DIR}
+    --frontier-id "${FRONTIER_ID}" \
+    --json "${OUT_DIR}/refined_round1.json" \
+    --out-dir "${OUT_DIR}"

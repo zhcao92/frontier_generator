@@ -78,6 +78,12 @@ ETA            = 0.0    # distance penalty coefficient in ADD step scoring
 KAPPA          = 5.0    # gain smoothing constant for weight computation
 Q_MIN          = 0.2    # minimum training weight
 
+# ── v3 Set-Cover Refinement constants ─────────────────────────────────────────
+COVERAGE_FRAC      = 0.65  # stop when this fraction of (cell, label) universe is covered
+SHIFT_RADIUS_CELLS = 5     # centroid radius in cells (1.0 m at 0.2 m/cell)
+WALL_MARGIN_CELLS  = 3     # erosion margin matching visual wall width
+PROXIMITY_DISQ_M   = 2.0   # disqualify candidates within this distance of selected
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 1.  Gain helpers
@@ -131,8 +137,8 @@ def bev_upper_mask_to_world_cells(reach_mask, frontier_xy, theta):
 
 def predict_gain_with_mask(frontier_xy, obs_wp_id, covered_g2c,
                            wp_pos_atlas, gain_model, device,
-                           wp_data_cache=None):
-    """Run gain model; return (gain_m2, connects, world_cells).
+                           wp_data_cache=None, extended=False):
+    """Run gain model; return (gain_m2, connects, world_cells[, evidence, preds]).
 
     Coverage uses the full covered_g2c mask (atlas_cov = atlas_cat >= 0),
     consistent with cmd_prepare training and cmd_predict visualization.
@@ -143,6 +149,11 @@ def predict_gain_with_mask(frontier_xy, obs_wp_id, covered_g2c,
 
     world_cells is a frozenset of (gx, gy) atlas indices covering the
     gain region (used for MERGE IoU).
+
+    When *extended=True*, additionally returns:
+      cell_evidence : {(gx,gy): -log(1-p)}  for free-predicted unobserved cells
+      cell_preds    : {(gx,gy): (argmax_class, p_free, p_obstacle)}  for ALL
+                      unobserved cells in the full BEV.
     """
     frontier_xy = np.asarray(frontier_xy, dtype=np.float64)[:2]
     wp_pos      = np.asarray(wp_pos_atlas, dtype=np.float64)
@@ -163,7 +174,8 @@ def predict_gain_with_mask(frontier_xy, obs_wp_id, covered_g2c,
         try:
             wp_data = _load_wp_data(obs_wp_id)
         except Exception:
-            return 0.0, False, frozenset()
+            return (0.0, False, frozenset(), {}, {}) if extended \
+                else (0.0, False, frozenset())
         if wp_data_cache is not None:
             wp_data_cache[obs_wp_id] = wp_data
 
@@ -172,7 +184,8 @@ def predict_gain_with_mask(frontier_xy, obs_wp_id, covered_g2c,
                               atlas_cat, atlas_cov, atlas_gmin,
                               wp_data=wp_data)
     except Exception:
-        return 0.0, False, frozenset()
+        return (0.0, False, frozenset(), {}, {}) if extended \
+            else (0.0, False, frozenset())
 
     inp_t = torch.from_numpy(inp.astype(np.float32)).unsqueeze(0).to(device)
     with torch.no_grad():
@@ -193,7 +206,48 @@ def predict_gain_with_mask(frontier_xy, obs_wp_id, covered_g2c,
     new_free_full = ((free_prob > 0.5)
                      & (inp[3] > 0))            # ch3: unobserved → predicted free
     cells = bev_upper_mask_to_world_cells(new_free_full, frontier_xy, theta)
-    return gain_m2, connects, cells
+
+    if not extended:
+        return gain_m2, connects, cells
+
+    # ── Extended returns for v3 set-cover ──────────────────────────────────
+    cos_t = math.cos(theta)
+    sin_t = math.sin(theta)
+    fx, fy = float(frontier_xy[0]), float(frontier_xy[1])
+
+    # cell_evidence: -log(1-p) for free-predicted unobserved cells
+    rows, cols = np.where(new_free_full)
+    cell_evidence = {}
+    for r, c in zip(rows, cols):
+        rx = HALF_EXTENT - (r + 0.5) * RESOLUTION
+        ry = (c + 0.5) * RESOLUTION - HALF_EXTENT
+        wx = fx + rx * cos_t - ry * sin_t
+        wy = fy + rx * sin_t + ry * cos_t
+        key = (int(round(wx / RESOLUTION)), int(round(wy / RESOLUTION)))
+        p = float(free_prob[r, c])
+        ev = -math.log(max(1.0 - p, 1e-7))
+        if key not in cell_evidence or ev > cell_evidence[key]:
+            cell_evidence[key] = ev
+
+    # cell_preds: (argmax_class, p_free, p_obstacle) for ALL unobserved cells
+    argmax_map = np.argmax(probs, axis=0)  # (H, W)
+    unobs_mask = inp[3] > 0
+    rows_u, cols_u = np.where(unobs_mask)
+    cell_preds = {}
+    for r, c in zip(rows_u, cols_u):
+        rx = HALF_EXTENT - (r + 0.5) * RESOLUTION
+        ry = (c + 0.5) * RESOLUTION - HALF_EXTENT
+        wx = fx + rx * cos_t - ry * sin_t
+        wy = fy + rx * sin_t + ry * cos_t
+        key = (int(round(wx / RESOLUTION)), int(round(wy / RESOLUTION)))
+        cls = int(argmax_map[r, c])
+        pf = float(probs[0, r, c])
+        po = float(probs[1, r, c])
+        mp = max(pf, po)
+        if key not in cell_preds or mp > max(cell_preds[key][1], cell_preds[key][2]):
+            cell_preds[key] = (cls, pf, po)
+
+    return gain_m2, connects, cells, cell_evidence, cell_preds
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -743,6 +797,271 @@ def refine_frontier_set_v2(wids, pred_world,
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 5b. v3: Set-cover greedy refinement
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _eroded_green(covered_g2c, margin=WALL_MARGIN_CELLS):
+    """Return green cells at least *margin* cells from any non-green cell.
+
+    This produces the "visually green" region: the visualization renders
+    obstacle cells wider than single atlas cells, so green cells near walls
+    appear inside the wall.  Eroding by *margin* cells compensates.
+    """
+    green_cells = {k for k, v in covered_g2c.items() if v == 1}
+    if margin <= 0:
+        return green_cells
+    # Non-green cells bordering the green region
+    border_nongreen = set()
+    for gx, gy in green_cells:
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nb = (gx + dx, gy + dy)
+            if nb not in green_cells:
+                border_nongreen.add(nb)
+    # Dilate non-green border by margin
+    too_close = set()
+    m2 = margin * margin
+    for bx, by in border_nongreen:
+        for dx in range(-margin, margin + 1):
+            for dy in range(-margin, margin + 1):
+                if dx * dx + dy * dy <= m2:
+                    too_close.add((bx + dx, by + dy))
+    return green_cells - too_close
+
+
+def _shift_to_green(wx, wy, covered_g2c, safe_green,
+                    radius_cells=SHIFT_RADIUS_CELLS):
+    """Shift a frontier to the centroid of nearby *safe* green cells.
+
+    1. BFS (unrestricted traversal) to find nearest safe-green cell.
+    2. Centroid of safe-green cells within *radius_cells* of that anchor.
+    3. Return shifted world coordinates.
+
+    Falls back to original position if no safe-green cell within 50 cells.
+    """
+    gx = int(round(wx / RESOLUTION))
+    gy = int(round(wy / RESOLUTION))
+
+    # Find anchor: nearest safe-green cell
+    if (gx, gy) in safe_green:
+        anchor = (gx, gy)
+    else:
+        visited = {(gx, gy)}
+        queue = deque([(gx, gy, 0)])
+        anchor = None
+        while queue:
+            cx, cy, d = queue.popleft()
+            if d > 50:  # max 10 m search
+                break
+            if (cx, cy) in safe_green:
+                anchor = (cx, cy)
+                break
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                nx, ny = cx + dx, cy + dy
+                if (nx, ny) not in visited:
+                    visited.add((nx, ny))
+                    queue.append((nx, ny, d + 1))
+        if anchor is None:
+            return wx, wy
+
+    # Centroid of safe-green cells within radius
+    ax, ay = anchor
+    sx, sy, cnt = 0, 0, 0
+    r2 = radius_cells * radius_cells
+    for dx in range(-radius_cells, radius_cells + 1):
+        for dy in range(-radius_cells, radius_cells + 1):
+            if dx * dx + dy * dy > r2:
+                continue
+            nx, ny = ax + dx, ay + dy
+            if (nx, ny) in safe_green:
+                sx += nx
+                sy += ny
+                cnt += 1
+    if cnt == 0:
+        cx, cy = anchor
+    else:
+        cx, cy = sx / cnt, sy / cnt
+    return cx * RESOLUTION, cy * RESOLUTION
+
+
+def refine_frontier_set_v3(wids, pred_world,
+                           covered_g2c, wp_positions,
+                           gain_model, device,
+                           wp_data_cache=None,
+                           add_wps=None,
+                           coverage_frac=COVERAGE_FRAC,
+                           shift_radius_cells=SHIFT_RADIUS_CELLS,
+                           wall_margin_cells=WALL_MARGIN_CELLS,
+                           proximity_disq_m=PROXIMITY_DISQ_M):
+    """Set-cover greedy frontier selection (v3).
+
+    Each frontier produces hard opinions: (cell, label) pairs where
+    label = argmax in {free, obstacle}.  Greedy set cover picks the
+    frontier covering the most uncovered pairs.  Stop when
+    |covered| / |universe| >= coverage_frac.
+
+    Pipeline: Shift → Score → Opinions → Set-cover → Weights.
+
+    Returns
+    -------
+    (frontiers, gains, connects, masks, sources, dropped, weights,
+     A0_frontiers, a0_cell_count, A0_masks, a0_mean_evidence, A0_pred_maps)
+    """
+
+    # ── Step 0: Shift frontiers to green region ─────────────────────────────
+    print("  [v3.0] Shifting frontiers to green region ...")
+    safe_green = _eroded_green(covered_g2c, margin=wall_margin_cells)
+    print(f"      Eroded green: {len(safe_green)} safe cells "
+          f"(margin={wall_margin_cells})")
+    shifted = 0
+    for i, entry in enumerate(pred_world):
+        ox, oy = entry[0], entry[1]
+        nx, ny = _shift_to_green(ox, oy, covered_g2c, safe_green,
+                                 radius_cells=shift_radius_cells)
+        if nx != ox or ny != oy:
+            pred_world[i] = [nx, ny, entry[2], entry[3]]
+            shifted += 1
+    print(f"      Shifted {shifted}/{len(pred_world)} frontiers")
+
+    # ── Step 1: Score DETR predictions with UNet ────────────────────────────
+    print("  [v3.1] Scoring DETR predictions ...")
+    A0_frontiers, A0_gains, A0_connects, A0_masks, A0_pred_maps = \
+        [], [], [], [], []
+    evidence_sum: dict = {}
+    evidence_cnt: dict = {}
+    for entry in pred_world:
+        x, y, conf, wp_id = entry[0], entry[1], entry[2], int(entry[3])
+        if wp_id not in wp_positions:
+            continue
+        g, c, m, ev, cp = predict_gain_with_mask(
+            np.array([x, y]), wp_id, covered_g2c,
+            wp_positions[wp_id], gain_model, device,
+            wp_data_cache, extended=True)
+        if g == 0.0:
+            continue
+        A0_frontiers.append([float(x), float(y), float(conf), int(wp_id)])
+        A0_gains.append(g)
+        A0_connects.append(c)
+        A0_masks.append(m)
+        A0_pred_maps.append(cp)
+        for cell, val in ev.items():
+            evidence_sum[cell] = evidence_sum.get(cell, 0.0) + val
+            evidence_cnt[cell] = evidence_cnt.get(cell, 0) + 1
+    a0_mean_evidence = {cell: evidence_sum[cell] / evidence_cnt[cell]
+                        for cell in evidence_sum}
+    print(f"      {len(pred_world)} raw → {len(A0_frontiers)} with gain>0")
+
+    # Cell coverage count (for compatibility / diagnostics)
+    a0_cell_count: dict = {}
+    for m in A0_masks:
+        for cell in m:
+            a0_cell_count[cell] = a0_cell_count.get(cell, 0) + 1
+
+    # ── Step 2: Build per-frontier opinion sets ─────────────────────────────
+    print("  [v3.2] Building opinion sets ...")
+    opinion_sets = []   # list of set[(cell, label)] per frontier
+    universe = set()    # all (cell, label) pairs across all frontiers
+    for cp in A0_pred_maps:
+        opinions = set()
+        for cell, (cls, pf, po) in cp.items():
+            if cls in (0, 1):  # free or obstacle
+                opinions.add((cell, cls))
+        opinion_sets.append(opinions)
+        universe |= opinions
+    n_universe = len(universe)
+    print(f"      {n_universe} (cell, label) pairs in universe")
+
+    if n_universe == 0:
+        print("      No structural opinions — returning empty set")
+        return ([], [], [], [], [], [], [],
+                A0_frontiers, a0_cell_count, A0_masks, a0_mean_evidence,
+                A0_pred_maps)
+
+    # ── Step 3: Greedy set cover ────────────────────────────────────────────
+    disq_r2 = proximity_disq_m * proximity_disq_m
+    print(f"  [v3.3] Greedy set cover "
+          f"(proximity={proximity_disq_m}m, target={coverage_frac}) ...")
+
+    covered = set()
+    selected_idx = []
+    candidates = set(range(len(A0_frontiers)))
+
+    while candidates:
+        best_idx = -1
+        best_gain = 0
+        for i in candidates:
+            gain = len(opinion_sets[i] - covered)
+            if gain > best_gain:
+                best_gain = gain
+                best_idx = i
+        if best_idx < 0 or best_gain == 0:
+            break
+
+        selected_idx.append(best_idx)
+        candidates.discard(best_idx)
+        covered |= opinion_sets[best_idx]
+
+        # Disqualify candidates too close to ANY selected frontier
+        too_close = set()
+        for i in candidates:
+            cx, cy = A0_frontiers[i][0], A0_frontiers[i][1]
+            for si in selected_idx:
+                dx = cx - A0_frontiers[si][0]
+                dy = cy - A0_frontiers[si][1]
+                if dx * dx + dy * dy <= disq_r2:
+                    too_close.add(i)
+                    break
+        candidates -= too_close
+
+        frac = len(covered) / n_universe
+        print(f"        pick #{len(selected_idx)}: A0[{best_idx}]  "
+              f"+{best_gain} opinions  coverage={frac:.3f}  "
+              f"disqualified={len(too_close)}")
+        if frac >= coverage_frac:
+            break
+
+    print(f"      Selected {len(selected_idx)}/{len(A0_frontiers)} frontiers  "
+          f"(coverage={len(covered)}/{n_universe} "
+          f"= {len(covered)/n_universe:.3f})")
+
+    # Build dropped list
+    selected_set = set(selected_idx)
+    dropped = []
+    for i in range(len(A0_frontiers)):
+        if i not in selected_set:
+            f = A0_frontiers[i]
+            dropped.append({'x': float(f[0]), 'y': float(f[1]),
+                            'conf': float(f[2]), 'wp_id': int(f[3]),
+                            'gain_m2': float(A0_gains[i]),
+                            'connects': bool(A0_connects[i]),
+                            'source': 'drop'})
+
+    # Build output lists
+    frontiers = [A0_frontiers[i] for i in selected_idx]
+    gains     = [A0_gains[i]     for i in selected_idx]
+    connects  = [A0_connects[i]  for i in selected_idx]
+    masks     = [A0_masks[i]     for i in selected_idx]
+    sources   = ['keep'] * len(frontiers)
+
+    # ── Step 4: Compute weights (same formula as v2) ────────────────────────
+    print("  [v3.4] Computing weights ...")
+    final_cell_count: dict = {}
+    for m in masks:
+        for cell in m:
+            final_cell_count[cell] = final_cell_count.get(cell, 0) + 1
+    weights = []
+    for m in masks:
+        delta_final = sum(
+            1 for cell in m if final_cell_count.get(cell, 0) == 1
+        ) * CELL_AREA
+        q = delta_final / (delta_final + KAPPA)
+        weights.append(float(max(Q_MIN, min(1.0, q))))
+
+    return (frontiers, gains, connects, masks, sources, dropped, weights,
+            A0_frontiers, a0_cell_count, A0_masks, a0_mean_evidence,
+            A0_pred_maps)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 6.  DETR inference
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -856,6 +1175,46 @@ def save_round_results(out_dir, rnd, frontiers, gains, connects,
     return path
 
 
+def save_a0_data(out_dir, rnd, a0_frontiers, a0_cell_count,
+                 a0_masks=None, a0_mean_evidence=None, a0_pred_maps=None):
+    """Save pre-refinement A0 diagnostic data (v3).
+
+    Files produced:
+        a0_frontiers_round{rnd}.json   — scored DETR predictions before selection
+        a0_cell_count_round{rnd}.pkl   — {(gx,gy): int} coverage count
+        a0_masks_round{rnd}.pkl        — list of frozenset, per-frontier gain cells
+        a0_mean_evidence_round{rnd}.pkl — {(gx,gy): float} mean -log(1-p)
+        a0_pred_maps_round{rnd}.pkl    — list of {(gx,gy): (cls,pf,po)} full preds
+    """
+    import pickle
+
+    data = [{'id': i, 'x': float(f[0]), 'y': float(f[1]),
+             'conf': float(f[2]), 'wp_id': int(f[3])}
+            for i, f in enumerate(a0_frontiers)]
+    json_path = os.path.join(out_dir, f"a0_frontiers_round{rnd}.json")
+    with open(json_path, 'w') as fh:
+        json.dump(data, fh, indent=2)
+
+    pkl_path = os.path.join(out_dir, f"a0_cell_count_round{rnd}.pkl")
+    with open(pkl_path, 'wb') as fh:
+        pickle.dump(a0_cell_count, fh)
+
+    if a0_masks is not None:
+        with open(os.path.join(out_dir, f"a0_masks_round{rnd}.pkl"), 'wb') as fh:
+            pickle.dump(a0_masks, fh)
+
+    if a0_mean_evidence is not None:
+        with open(os.path.join(out_dir, f"a0_mean_evidence_round{rnd}.pkl"), 'wb') as fh:
+            pickle.dump(a0_mean_evidence, fh)
+
+    if a0_pred_maps is not None:
+        with open(os.path.join(out_dir, f"a0_pred_maps_round{rnd}.pkl"), 'wb') as fh:
+            pickle.dump(a0_pred_maps, fh)
+
+    print(f"    [saved] A0: {len(a0_frontiers)} frontiers, "
+          f"{len(a0_cell_count)} cells → {json_path}")
+
+
 def print_round_summary(rnd, frontiers, gains, connects):
     mean_g = float(np.mean(gains)) if gains else 0.0
     n_conn = sum(connects)
@@ -872,16 +1231,15 @@ def generate_supervision_signal(frontier_id, detr_model, gain_model,
                                 wids, rnd, out_dir,
                                 wp_data_cache=None,
                                 add_wps=None,
-                                include_absent=True):
-    """Full pipeline: DETR inference → v2 refinement (with scoring) → save JSON.
-
-    Scoring of DETR predictions is now done inside refine_frontier_set_v2;
-    there is no separate step 2.
+                                include_absent=True,
+                                refine_method='v2'):
+    """Full pipeline: DETR inference → refinement → save JSON.
 
     Parameters
     ----------
-    add_wps       : list[int] or None  WPs to search in ADD step; None = wids
-    include_absent: bool  (unused in v2, kept for API compatibility)
+    add_wps        : list[int] or None  WPs to search in ADD step; None = wids
+    include_absent : bool  (unused in v2/v3, kept for API compatibility)
+    refine_method  : 'v2' | 'v3'  refinement algorithm to use
 
     Returns
     -------
@@ -895,14 +1253,25 @@ def generate_supervision_signal(frontier_id, detr_model, gain_model,
         wp_data_cache=wp_data_cache)
     print(f"      {len(pred_world)} raw predictions")
 
-    # 2. v2 Refinement (scoring is performed inside)
-    print("  [2] Refining frontier set (v2) ...")
-    (ref_frontiers, ref_gains, ref_connects, ref_masks,
-     ref_sources, ref_dropped, ref_weights) = refine_frontier_set_v2(
-        wids, pred_world,
-        covered_g2c, wp_positions, gain_model, device,
-        wp_data_cache=wp_data_cache,
-        add_wps=add_wps)
+    # 2. Refinement (dispatch by method)
+    if refine_method == 'v3':
+        print("  [2] Refining frontier set (v3 — set cover) ...")
+        (ref_frontiers, ref_gains, ref_connects, ref_masks,
+         ref_sources, ref_dropped, ref_weights,
+         a0_frontiers, a0_cell_count, a0_masks,
+         a0_mean_evidence, a0_pred_maps) = refine_frontier_set_v3(
+            wids, pred_world,
+            covered_g2c, wp_positions, gain_model, device,
+            wp_data_cache=wp_data_cache,
+            add_wps=add_wps)
+    else:
+        print("  [2] Refining frontier set (v2 — DROP+MERGE+ADD) ...")
+        (ref_frontiers, ref_gains, ref_connects, ref_masks,
+         ref_sources, ref_dropped, ref_weights) = refine_frontier_set_v2(
+            wids, pred_world,
+            covered_g2c, wp_positions, gain_model, device,
+            wp_data_cache=wp_data_cache,
+            add_wps=add_wps)
 
     print_round_summary(rnd, ref_frontiers, ref_gains, ref_connects)
 
@@ -912,6 +1281,11 @@ def generate_supervision_signal(frontier_id, detr_model, gain_model,
                               sources=ref_sources, dropped=ref_dropped,
                               weights=ref_weights,
                               wp_positions=wp_positions, wids=wids)
+
+    # 4. Save A0 diagnostic data (v3 only)
+    if refine_method == 'v3':
+        save_a0_data(out_dir, rnd, a0_frontiers, a0_cell_count,
+                     a0_masks, a0_mean_evidence, a0_pred_maps)
 
     return (ref_frontiers, ref_gains, ref_connects, ref_masks,
             ref_sources, ref_dropped, ref_weights, path)
@@ -924,9 +1298,10 @@ def generate_supervision_signal(frontier_id, detr_model, gain_model,
 def main():
     global DELTA_DROP, DELTA_KEEP, DELTA_ADD, MAX_ADD_PER_WP
     global ETA, KAPPA, Q_MIN, CONF_THRESH, BOUNDARY_RADIUS
+    global COVERAGE_FRAC, SHIFT_RADIUS_CELLS, WALL_MARGIN_CELLS, PROXIMITY_DISQ_M
 
     ap = argparse.ArgumentParser(
-        description='Generate self-supervised frontier pseudo-labels (v2)',
+        description='Generate self-supervised frontier pseudo-labels',
         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     ap.add_argument('--frontier-id',      type=int,   required=True)
     ap.add_argument('--detr-checkpoint',  type=str,   default=None,
@@ -937,6 +1312,9 @@ def main():
     ap.add_argument('--out-dir',          type=str,   default=None)
     ap.add_argument('--round',            type=int,   default=1,
                     help='Round index used in output filename')
+    ap.add_argument('--refine-method',    type=str,   default='v2',
+                    choices=['v2', 'v3'],
+                    help='"v2"=DROP+MERGE+ADD; "v3"=set-cover greedy selection')
     # v2 thresholds
     ap.add_argument('--delta-drop',       type=float, default=DELTA_DROP,
                     help='Marginal coverage (m²) below which prediction is DROPped')
@@ -957,6 +1335,11 @@ def main():
     ap.add_argument('--add-wps',          type=str,   default='obs',
                     choices=['all', 'obs'],
                     help='"all" = all WPs in map; "obs" = observing WPs only')
+    # v3 thresholds
+    ap.add_argument('--coverage-frac',    type=float, default=COVERAGE_FRAC,
+                    help='v3: stop when this fraction of opinion universe is covered')
+    ap.add_argument('--proximity-disq-m', type=float, default=PROXIMITY_DISQ_M,
+                    help='v3: disqualify candidates within this distance (m)')
     args = ap.parse_args()
 
     if args.detr_checkpoint is None and args.pred_json is None:
@@ -965,14 +1348,16 @@ def main():
         ap.error('--detr-checkpoint and --pred-json are mutually exclusive')
 
     # Override globals
-    DELTA_DROP     = args.delta_drop
-    DELTA_KEEP     = args.delta_keep
-    DELTA_ADD      = args.delta_add
-    MAX_ADD_PER_WP = args.max_add_per_wp
-    KAPPA          = args.kappa
-    Q_MIN          = args.q_min
-    CONF_THRESH    = args.conf_thresh
+    DELTA_DROP      = args.delta_drop
+    DELTA_KEEP      = args.delta_keep
+    DELTA_ADD       = args.delta_add
+    MAX_ADD_PER_WP  = args.max_add_per_wp
+    KAPPA           = args.kappa
+    Q_MIN           = args.q_min
+    CONF_THRESH     = args.conf_thresh
     BOUNDARY_RADIUS = args.boundary_radius
+    COVERAGE_FRAC   = args.coverage_frac
+    PROXIMITY_DISQ_M = args.proximity_disq_m
 
     device = _get_device()
     print(f"[refine] Device: {device}")
@@ -1028,20 +1413,36 @@ def main():
     # Determine WPs to search in ADD step
     add_wps = list(wp_positions.keys()) if args.add_wps == 'all' else wids
 
-    # Refine (v2 — scoring is performed inside)
-    print("[refine] Refining (v2) ...")
-    (ref_frontiers, ref_gains, ref_connects, ref_masks,
-     ref_sources, ref_dropped, ref_weights) = refine_frontier_set_v2(
-        wids, pred_world,
-        covered_g2c, wp_positions, gain_model, device,
-        wp_data_cache=wp_data_cache,
-        add_wps=add_wps)
+    # Refine
+    if args.refine_method == 'v3':
+        print("[refine] Refining (v3 — set cover) ...")
+        (ref_frontiers, ref_gains, ref_connects, ref_masks,
+         ref_sources, ref_dropped, ref_weights,
+         a0_frontiers, a0_cell_count, a0_masks,
+         a0_mean_evidence, a0_pred_maps) = refine_frontier_set_v3(
+            wids, pred_world,
+            covered_g2c, wp_positions, gain_model, device,
+            wp_data_cache=wp_data_cache,
+            add_wps=add_wps)
+    else:
+        print("[refine] Refining (v2 — DROP+MERGE+ADD) ...")
+        (ref_frontiers, ref_gains, ref_connects, ref_masks,
+         ref_sources, ref_dropped, ref_weights) = refine_frontier_set_v2(
+            wids, pred_world,
+            covered_g2c, wp_positions, gain_model, device,
+            wp_data_cache=wp_data_cache,
+            add_wps=add_wps)
 
     print_round_summary(args.round, ref_frontiers, ref_gains, ref_connects)
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     save_round_results(out_dir, args.round, ref_frontiers, ref_gains, ref_connects,
                        sources=ref_sources, dropped=ref_dropped, weights=ref_weights,
                        wp_positions=wp_positions, wids=wids)
+
+    if args.refine_method == 'v3':
+        save_a0_data(out_dir, args.round, a0_frontiers, a0_cell_count,
+                     a0_masks, a0_mean_evidence, a0_pred_maps)
+
     print(f"\n[refine] Done.  Output: {out_dir}/refined_round{args.round}.json")
 
 
