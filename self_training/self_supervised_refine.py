@@ -178,7 +178,8 @@ def self_supervised_loop(frontier_id, detr_checkpoint, gain_checkpoint,
                          n_rounds=N_ROUNDS, out_dir=None,
                          no_finetune=False,
                          add_wps_mode='all',
-                         include_absent=True):
+                         include_absent=True,
+                         refine_method='v2'):
     """N rounds of: supervision signal generation → DETR fine-tune.
 
     Parameters
@@ -186,6 +187,7 @@ def self_supervised_loop(frontier_id, detr_checkpoint, gain_checkpoint,
     no_finetune    : bool  skip DETR fine-tuning (debugging ADD logic)
     add_wps_mode   : 'all' | 'obs'  WPs to search in ADD step
     include_absent : bool  include absent-atlas cells in boundary detection
+    refine_method  : 'v2' | 'v3'  refinement algorithm
     """
     if out_dir is None:
         out_dir = f"ss_output/{frontier_id}"
@@ -248,7 +250,8 @@ def self_supervised_loop(frontier_id, detr_checkpoint, gain_checkpoint,
                 wids, rnd, out_dir,
                 wp_data_cache=wp_data_cache,
                 add_wps=add_wps,
-                include_absent=include_absent)
+                include_absent=include_absent,
+                refine_method=refine_method)
 
         # ref_frontiers now has wp_id already set to nearest observing WP.
         # Training will use these assignments directly.
@@ -298,6 +301,9 @@ def main():
                     help='"all"=all map WPs; "obs"=observing WPs only')
     ap.add_argument('--no-absent',       action='store_true',
                     help='Restrict ADD to cat0-only boundaries (skip absent cells)')
+    ap.add_argument('--refine-method',  type=str,   default='v2',
+                    choices=['v2', 'v3'],
+                    help='"v2"=DROP+MERGE+ADD; "v3"=set-cover greedy selection')
     args = ap.parse_args()
 
     FEW_EPOCHS  = args.epochs
@@ -312,6 +318,7 @@ def main():
         no_finetune    = args.no_finetune,
         add_wps_mode   = args.add_wps,
         include_absent = not args.no_absent,
+        refine_method  = args.refine_method,
     )
 
 

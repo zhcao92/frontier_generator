@@ -7,34 +7,42 @@ A self-supervised learning framework for robotic exploration frontier prediction
 This repository contains the self-supervised training pipeline for frontier exploration prediction. The system uses:
 
 1. **DETR Model** - Predicts frontier positions as (x,y) coordinates using transformer architecture
-2. **UNet Model** - Predicts exploration gain (m²) for each frontier
+2. **UNet Model** - Predicts exploration gain (m²) and per-cell occupancy (free/obstacle/unknown/unobserved) for each frontier
 3. **Self-Supervised Refinement** - Iteratively improves predictions using pseudo-labels generated from model outputs
 
-The pipeline implements a three-stage refinement process (DROP → MERGE → ADD) to generate high-quality pseudo-labels for continuous model improvement.
+Two refinement algorithms are available:
+- **v2 (DROP+MERGE+ADD)** — marginal-coverage filtering, greedy deduplication, boundary-based candidate addition
+- **v3 (Set Cover)** — greedy submodular set cover on per-cell (cell, label) opinion pairs with shift-to-green positioning and proximity disqualification
 
 ## Project Structure
 
 ```
 frontier_generator/
-├── models/                        # ML model implementations
-│   ├── frontier_detr_model.py     # DETR position prediction model
-│   ├── frontier_gain_model.py     # UNet gain prediction model
-│   └── map_utils.py               # Data loading & coordinate utilities
+├── config/                           # Centralized configuration
+│   ├── __init__.py                   # Python config loader (load_config)
+│   ├── defaults.yaml                 # All paths, thresholds, and hyperparameters
+│   └── env.sh                        # Shell-sourceable env vars (reads from defaults.yaml)
 │
-├── self_training/                 # Self-supervised training pipeline
-│   ├── self_supervised_refine.py  # Main training loop
-│   └── frontier_refine.py         # Pseudo-label generation (DROP/MERGE/ADD)
+├── models/                           # ML model implementations
+│   ├── frontier_detr_model.py        # DETR position prediction model
+│   ├── frontier_gain_model.py        # UNet gain prediction model
+│   └── map_utils.py                  # Data loading & coordinate utilities
 │
-├── visualization/                 # Visualization tools
-│   ├── plot_refinement.py         # Visualize pseudo-labels & refinement process
-│   └── plot_predictions.py        # Visualize model predictions on map
+├── self_training/                    # Self-supervised training pipeline
+│   ├── self_supervised_refine.py     # Main training loop (v2/v3 dispatch)
+│   └── frontier_refine.py            # Pseudo-label generation (v2 & v3)
 │
-├── scripts/                       # Quick-start scripts
-│   ├── run_ss_refine_1round.sh    # 1-round training + full visualization
-│   └── run_ss_refine_nofinetune.sh # Inference only (no fine-tuning)
+├── visualization/                    # Visualization tools
+│   ├── plot_refinement.py            # Visualize pseudo-labels & refinement process
+│   ├── plot_predictions.py           # Visualize model predictions on map
+│   └── plot_coverage_heatmap.py      # A0 mean-evidence coverage heatmap (v3)
 │
-├── requirements.txt               # Python dependencies
-└── README.md                      # This file
+├── scripts/                          # Quick-start scripts
+│   ├── run_ss_refine_1round.sh       # 1-round training + visualization + finetuned eval
+│   └── run_ss_refine_nofinetune.sh   # Inference only (no fine-tuning)
+│
+├── requirements.txt
+└── README.md
 ```
 
 ## Installation
@@ -51,11 +59,41 @@ frontier_generator/
 pip install -r requirements.txt
 ```
 
-For GPU support, install PyTorch with CUDA from [pytorch.org](https://pytorch.org/).
+## Configuration
+
+All paths, thresholds, and hyperparameters live in **`config/defaults.yaml`**. Edit this file for your machine:
+
+```yaml
+paths:
+  tiamat_data_dir: /path/to/your/data
+  detr_checkpoint: /path/to/detr_model_best.pt
+  gain_checkpoint: /path/to/gain_model_final.pt
+  frontier_id: 7000
+```
+
+The config system has three layers (later wins):
+1. Hardcoded defaults in `config/__init__.py`
+2. `config/defaults.yaml` overrides
+3. Environment variables (`TIAMAT_DATA_DIR`, `DETR_CHECKPOINT`, `GAIN_CHECKPOINT`, `FRONTIER_ID`)
+
+Shell scripts source `config/env.sh` automatically. Python code can use:
+
+```python
+from config import load_config
+cfg = load_config()
+```
+
+### Key Configuration Sections
+
+| Section | Examples |
+|---------|----------|
+| `paths` | `tiamat_data_dir`, `detr_checkpoint`, `gain_checkpoint`, `frontier_id` |
+| `refinement` | `conf_thresh`, `kappa`, `q_min`, `boundary_radius` |
+| `v2` | `delta_drop`, `delta_keep`, `delta_add`, `max_add_per_wp` |
+| `v3` | `coverage_frac`, `shift_radius_cells`, `wall_margin_cells`, `proximity_disq_m` |
+| `training` | `few_epochs`, `finetune_lr`, `n_rounds` |
 
 ## Data Format
-
-This codebase expects data in the following structure:
 
 ```
 data_directory/
@@ -65,53 +103,54 @@ data_directory/
 └── waypoints/             # Sensor data per waypoint
     └── {waypoint_id}/
         ├── meta.json      # Camera calibration & pose
-        ├── *.png          # RGB images (5 cameras: back, left, right, frontleft, frontright)
-        └── *_depth.npy    # Depth maps (corresponding to RGB images)
-```
-
-### Environment Variable
-
-Set your data directory via:
-
-```bash
-export TIAMAT_DATA_DIR=/path/to/your/data
+        ├── *.png          # RGB images (5 cameras)
+        └── *_depth.npy    # Depth maps
 ```
 
 ## Quick Start
 
 ### Option 1: 1-Round Training with Visualization
 
-Run self-supervised training for 1 round (10 epochs) with complete visualization:
-
 ```bash
+# v2 refinement (default)
 bash scripts/run_ss_refine_1round.sh
+
+# v3 set-cover refinement
+REFINE_METHOD=v3 bash scripts/run_ss_refine_1round.sh
 ```
 
-**This script performs:**
-1. Self-supervised DETR fine-tuning (10 epochs)
-2. Pseudo-label visualization (color-coded by source: keep/add/drop/merge)
-3. Batch plot generation with fine-tuned model predictions
+**Pipeline steps:**
+1. Self-supervised DETR fine-tuning (1 round)
+2. Pseudo-label visualization
+3. Batch plot with fine-tuned model predictions
+4. *(v3 only)* Re-run refinement with finetuned DETR to evaluate improvement
+5. *(v3 only)* Coverage heatmap from finetuned evaluation
 
-**Outputs saved to:** `results/7000_1round/`
-- `detr_ss_round1.pt` - Fine-tuned DETR model
-- `refined_round1.json` - Pseudo-labels
-- `refined_round1.png` - Pseudo-label visualization
-- `summary_map_gain_generation.png` - Model predictions on map
+**Output structure:**
+```
+results/{frontier_id}_1round/
+├── detr_ss_round1.pt                       # Fine-tuned DETR model
+├── refined_round1.json                     # Pseudo-labels
+├── refined_round1.png                      # Pseudo-label visualization
+├── summary_map_gain_generation.png         # Predicted frontiers + gains on map
+└── finetuned_eval/                         # (v3 only)
+    ├── refined_round1.json                 # Re-evaluated with finetuned DETR
+    ├── a0_frontiers_round1.json            # Pre-refinement A0 predictions
+    ├── a0_mean_evidence_round1.pkl         # Per-cell mean evidence
+    └── a0_frontiers_round1_coverage.png    # Coverage heatmap
+```
 
 ### Option 2: Inference Only (No Fine-tuning)
 
-Generate pseudo-labels without model fine-tuning:
-
 ```bash
+# v3 refinement (default for nofinetune)
 bash scripts/run_ss_refine_nofinetune.sh
+
+# v2 refinement
+REFINE_METHOD=v2 bash scripts/run_ss_refine_nofinetune.sh
 ```
 
-**This is useful for:**
-- Testing the refinement pipeline
-- Generating pseudo-labels with pre-trained models
-- Quick validation runs
-
-**Outputs saved to:** `results/7000_nofinetune/`
+**Outputs saved to:** `results/{frontier_id}_nofinetune/`
 
 ## Manual Usage
 
@@ -123,7 +162,21 @@ python3 self_training/self_supervised_refine.py \
     --detr-checkpoint /path/to/detr_model.pt \
     --gain-checkpoint /path/to/gain_model.pt \
     --rounds 3 \
+    --refine-method v3 \
     --out-dir results/7000_3rounds
+```
+
+### Standalone Refinement (no training loop)
+
+```bash
+python3 self_training/frontier_refine.py \
+    --frontier-id 7000 \
+    --detr-checkpoint /path/to/detr_model.pt \
+    --gain-checkpoint /path/to/gain_model.pt \
+    --refine-method v3 \
+    --coverage-frac 0.65 \
+    --proximity-disq-m 2.0 \
+    --out-dir results/7000_standalone
 ```
 
 ### Visualize Pseudo-Labels
@@ -135,124 +188,62 @@ python3 visualization/plot_refinement.py \
     --out-dir results/7000_3rounds
 ```
 
-### Batch Visualization with Predictions
+### Coverage Heatmap (v3)
 
 ```bash
-python3 visualization/plot_predictions.py \
-    --ids 7000 \
-    --mode summary_map_gain_generation \
-    --detr-checkpoint results/7000_3rounds/detr_ss_round1.pt \
-    --checkpoint /path/to/gain_model.pt \
-    --out-dir results/7000_3rounds
+python3 visualization/plot_coverage_heatmap.py \
+    --frontier-id 7000 \
+    --a0-json results/finetuned_eval/a0_frontiers_round1.json \
+    --evidence-pkl results/finetuned_eval/a0_mean_evidence_round1.pkl \
+    --out-dir results/finetuned_eval
 ```
-
-## Key Parameters
-
-### Training Parameters
-- `--frontier-id`: Frontier ID to process (integer)
-- `--rounds`: Number of self-supervised refinement rounds (default: 1)
-- `--no-finetune`: Skip DETR fine-tuning (inference only)
-
-### Model Checkpoints
-- `--detr-checkpoint`: Pre-trained DETR model path (.pt file)
-- `--gain-checkpoint`: Pre-trained UNet gain model path (.pt file)
-
-### Output
-- `--out-dir`: Output directory for results (models, JSON, visualizations)
-
-### Visualization Modes
-- `full`: Per-waypoint views + summary map (with RGB)
-- `summary`: Summary map with RGB thumbnails
-- `summary_map_only`: Center map only (fastest)
-- `summary_map_gain_generation`: Map with frontier gain predictions
-
-## Output Structure
-
-After running training, outputs are organized as:
-
-```
-results/
-└── {frontier_id}_{config}/
-    ├── refined_round1.json                # Pseudo-labels (keep/add/drop/merge)
-    ├── refined_round2.json                # Pseudo-labels round 2 (if multi-round)
-    ├── detr_ss_round1.pt                  # Fine-tuned DETR model
-    ├── detr_ss_round2.pt                  # Fine-tuned DETR model round 2
-    ├── refined_round1.png                 # Pseudo-label visualization
-    └── summary_map_gain_generation.png    # Predicted frontiers + gains on map
-```
-
-## Model Checkpoints
-
-**Note**: Pre-trained model checkpoint files (`.pt`) are not included in this repository.
-
-To use this codebase:
-1. Train your own models using the training scripts in `models/`
-2. Or obtain pre-trained checkpoints separately
-
-## Configuration
-
-### Hyperparameters
-
-Training hyperparameters can be adjusted in `self_training/self_supervised_refine.py`:
-
-```python
-FEW_EPOCHS  = 10      # Epochs per refinement round
-FINETUNE_LR = 1e-5    # Learning rate for DETR fine-tuning
-N_ROUNDS    = 3       # Default number of refinement rounds
-```
-
-### Script Customization
-
-Edit the shell scripts in `scripts/` to customize:
-- Frontier IDs to process (`FRONTIER_ID=7000`)
-- Number of refinement rounds (`ROUNDS=1`)
-- Model checkpoint paths
-- Output directory locations
-
-### Environment Variables
-
-- `TIAMAT_DATA_DIR`: Path to data directory (**required**)
-- `DEBUG_WP`: Debug specific waypoint ID (optional, for development)
 
 ## Algorithm Details
 
-### Self-Supervised Refinement Pipeline
+### v2: DROP + MERGE + ADD
 
-Each refinement round consists of:
+Each refinement round:
+1. **DETR Inference** — generate raw frontier predictions per observing waypoint
+2. **Score** — run UNet gain model; filter by `conf_thresh`
+3. **DROP** — remove predictions with marginal gain < `delta_drop`
+4. **MERGE** — greedy deduplication by cell overlap IoU; keep higher-gain frontier
+5. **ADD** — scan free-unknown boundary regions for missed frontiers (gain > `delta_add`)
+6. **Weights** — per-frontier training weight: `max(q_min, gain / (gain + kappa))`
+7. **DETR Fine-tuning** — train on refined pseudo-labels (optional)
 
-1. **DETR Inference**: Generate raw frontier position predictions
-2. **Pseudo-Label Refinement**:
-   - **DROP**: Remove low-gain predictions (gain < threshold)
-   - **MERGE**: Eliminate overlapping predictions (keep higher gain)
-   - **ADD**: Scan boundary regions for missed frontiers
-3. **DETR Fine-tuning**: Train on refined pseudo-labels (optional)
+### v3: Set Cover
 
-The process repeats for multiple rounds, progressively improving prediction quality.
+Each refinement round:
+1. **Shift to Green** — move each frontier to the nearest safe-green region (eroded by `wall_margin_cells` to avoid visual wall overlap), via BFS anchor + local centroid
+2. **Score** — run UNet gain model with extended output (per-cell evidence and predictions)
+3. **Build Opinions** — each frontier produces hard opinions `{(cell, argmax_class)}` where class is free or obstacle
+4. **Greedy Set Cover** — iteratively select frontier covering the most uncovered (cell, label) pairs; stop at `coverage_frac` (default 0.65); disqualify candidates within `proximity_disq_m` (default 2.0m) of any already-selected frontier
+5. **Weights** — same formula as v2
+6. **DETR Fine-tuning** — train on selected pseudo-labels (optional)
 
-### Key Features
+### Finetuned Evaluation (v3)
+
+After DETR finetuning, the 1-round script re-runs the v3 pipeline with the finetuned model (no further finetuning). This produces a new set of A0 predictions — typically fewer and better-placed than the initial model's — along with a coverage heatmap showing prediction quality improvement.
+
+### Key Concepts
 
 - **Set-based prediction**: DETR predicts variable number of frontiers (max 10 per waypoint)
-- **Gain-aware refinement**: Uses UNet gain predictions to filter/score frontiers
-- **Nearest WP assignment**: Each frontier associates with its nearest observing waypoint for training
-- **Reachability checking**: Only counts gain reachable through free space
+- **Gain-aware refinement**: UNet gain predictions filter and score frontiers
+- **Nearest WP reassignment**: Each refined frontier is reassigned to its nearest observing waypoint for training
+- **A0 data**: Pre-refinement scored DETR predictions; saved as diagnostic data for v3 coverage analysis
 
 ## Troubleshooting
 
 ### Missing Data Files
 
 If you encounter `FileNotFoundError`:
-- Verify `TIAMAT_DATA_DIR` points to correct directory
+- Verify `tiamat_data_dir` in `config/defaults.yaml` points to correct directory
 - Check that `atlas.pkl`, `frontiers/`, and `waypoints/` exist
-- The code gracefully handles missing waypoint sensor data (assigns zero gain)
 
 ### CUDA Out of Memory
 
-Reduce memory usage:
 ```bash
-# Force CPU execution
-export CUDA_VISIBLE_DEVICES=""
-
-# Or reduce batch size in training loop (edit self_supervised_refine.py)
+export CUDA_VISIBLE_DEVICES=""   # force CPU
 ```
 
 ### Import Errors
@@ -265,51 +256,22 @@ python3 self_training/self_supervised_refine.py ...
 
 The shell scripts automatically set `PYTHONPATH` correctly.
 
-### Visualization Not Generated
-
-Check that:
-- matplotlib backend is available (`Agg` backend used for headless systems)
-- Output directory has write permissions
-- Frontier JSON file exists at specified path
-
 ## Development
 
 ### Code Organization
 
+- **config/**: Single source of truth for all paths and constants
 - **models/**: Self-contained model definitions and data utilities
 - **self_training/**: Training pipeline and pseudo-label generation logic
-- **visualization/**: Standalone visualization scripts (can run independently)
+- **visualization/**: Standalone visualization scripts
 - **scripts/**: High-level workflow automation
 
 ### Testing Your Changes
 
-Run the no-finetune script for quick validation:
 ```bash
-bash scripts/run_ss_refine_nofinetune.sh  # ~1 minute
+# Quick validation (~1 min)
+bash scripts/run_ss_refine_nofinetune.sh
+
+# Full pipeline (~5-10 min with GPU)
+REFINE_METHOD=v3 bash scripts/run_ss_refine_1round.sh
 ```
-
-For full pipeline testing:
-```bash
-bash scripts/run_ss_refine_1round.sh      # ~5-10 minutes with GPU
-```
-
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@software{frontier_generator,
-  title = {Frontier Generator: Self-Supervised Refinement for Robotic Exploration},
-  year = {2025},
-  author = {[Your Name/Organization]},
-  url = {https://github.com/[your-username]/frontier_generator}
-}
-```
-
-## License
-
-[Add your license here - e.g., MIT, Apache 2.0, etc.]
-
-## Contact
-
-For questions or issues, please open an issue on GitHub.

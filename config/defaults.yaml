@@ -1,0 +1,39 @@
+# frontier_generator configuration
+# Edit this file to override defaults for your machine.
+# Values here are merged on top of hardcoded defaults in config/__init__.py.
+
+paths:
+  tiamat_data_dir: /home/wweiyi/frontier_generator/set2
+  detr_checkpoint: /home/wweiyi/frontier_generator/checkpoints/detr_model_best.pt
+  gain_checkpoint: /home/wweiyi/frontier_generator/checkpoints/gain_model_final.pt
+  frontier_id: 7000
+
+refinement:
+  conf_thresh:        0.3
+  atlas_flood_radius: 15.0
+  remove_gain_thresh: 1.0
+  overlap_thresh:     0.50
+  cover_radius:       3.0
+  boundary_radius:    5.0
+  sample_stride:      0.6
+  add_gain_thresh:    0.0
+  kappa:              5.0
+  q_min:              0.2
+
+v2:
+  delta_drop:     1.0
+  delta_keep:     1.0
+  delta_add:      5.0
+  max_add_per_wp: 2
+  eta:            0.0
+
+v3:
+  coverage_frac:      0.65
+  shift_radius_cells: 5
+  wall_margin_cells:  3
+  proximity_disq_m:   2.0
+
+training:
+  few_epochs:  50
+  finetune_lr: 1.0e-5
+  n_rounds:    3
