@@ -37,7 +37,8 @@ from models.frontier_gain_model import (
 from models.map_utils import load_frontier_data
 from self_training.frontier_refine import (
     predict_gain_with_mask, _load_wp_data, save_round_results,
-    KAPPA, Q_MIN,
+    _eroded_green, _shift_to_green,
+    KAPPA, Q_MIN, SHIFT_RADIUS_CELLS, WALL_MARGIN_CELLS,
 )
 from visualization import plot_predictions as _bp
 
@@ -140,6 +141,63 @@ def score_candidates(candidates, covered_g2c, wp_positions, gain_model,
         A0_pred_maps.append(preds)
 
     return A0_frontiers, A0_gains, A0_connects, A0_masks, A0_pred_maps, n_zero
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 3b. Shift scored candidates to safe green regions
+# ═══════════════════════════════════════════════════════════════════════════
+
+def shift_to_safe(A0_frontiers, A0_gains, A0_connects, A0_masks, A0_pred_maps,
+                  covered_g2c, wp_positions, gain_model, device, wp_data_cache,
+                  shift_radius_cells=SHIFT_RADIUS_CELLS,
+                  wall_margin_cells=WALL_MARGIN_CELLS):
+    """Shift scored frontiers to safe green regions, then re-score.
+
+    Returns updated (A0_frontiers, A0_gains, A0_connects, A0_masks, A0_pred_maps).
+    """
+    safe_green = _eroded_green(covered_g2c, margin=wall_margin_cells)
+    print(f"    Eroded green: {len(safe_green)} safe cells "
+          f"(margin={wall_margin_cells})")
+
+    shifted = 0
+    new_frontiers = []
+    new_gains = []
+    new_connects = []
+    new_masks = []
+    new_pred_maps = []
+
+    for i, entry in enumerate(A0_frontiers):
+        ox, oy = entry[0], entry[1]
+        nx, ny = _shift_to_green(ox, oy, covered_g2c, safe_green,
+                                 radius_cells=shift_radius_cells)
+        moved = (nx != ox or ny != oy)
+        if moved:
+            shifted += 1
+            # Re-score at shifted position
+            wp_id = int(entry[3])
+            if wp_id not in wp_positions:
+                continue
+            wp_pos = wp_positions[wp_id]
+            gain_m2, connects, cells, evidence, preds = predict_gain_with_mask(
+                [nx, ny], wp_id, covered_g2c, wp_pos, gain_model, device,
+                wp_data_cache=wp_data_cache, extended=True)
+            if gain_m2 <= 0:
+                continue
+            new_frontiers.append([nx, ny, entry[2], entry[3]])
+            new_gains.append(gain_m2)
+            new_connects.append(connects)
+            new_masks.append(cells)
+            new_pred_maps.append(preds)
+        else:
+            new_frontiers.append(entry)
+            new_gains.append(A0_gains[i])
+            new_connects.append(A0_connects[i])
+            new_masks.append(A0_masks[i])
+            new_pred_maps.append(A0_pred_maps[i])
+
+    print(f"    Shifted {shifted}/{len(A0_frontiers)} candidates, "
+          f"{len(new_frontiers)} survived re-scoring")
+    return new_frontiers, new_gains, new_connects, new_masks, new_pred_maps
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -416,8 +474,46 @@ def plot_step2_scored(frontier_id, wids, candidates, A0_frontiers, A0_gains,
                    os.path.join(out_dir, 'step2_scored.png'))
 
 
-def plot_step3_selected(frontier_id, wids, sel_frontiers, sel_gains,
-                        dropped, out_dir):
+def plot_step3_shifted(frontier_id, wids, pre_frontiers, post_frontiers,
+                       post_gains, out_dir):
+    """Plot shift-to-safe result: arrows from pre to post positions."""
+    fig = plt.figure(figsize=(24, 20))
+    ax  = fig.add_subplot(111)
+    _draw_atlas_background(ax, wids)
+
+    # Draw shift arrows + post positions
+    n_shifted = 0
+    if pre_frontiers and post_frontiers:
+        # Build lookup of post positions for arrow drawing
+        for pre, post, g in zip(pre_frontiers, post_frontiers, post_gains):
+            ox, oy = pre[0], pre[1]
+            nx, ny = post[0], post[1]
+            moved = (abs(nx - ox) > 1e-6 or abs(ny - oy) > 1e-6)
+            if moved:
+                n_shifted += 1
+                ax.annotate('', xy=(nx, ny), xytext=(ox, oy),
+                            arrowprops=dict(arrowstyle='->', color='#888888',
+                                            lw=1.0, alpha=0.6),
+                            zorder=5)
+            sz = max(30, 30 + 60 * np.sqrt(g))
+            ax.scatter(nx, ny, c='cyan', s=sz, marker='*', zorder=6,
+                       edgecolors='darkcyan', linewidths=0.5, alpha=0.9)
+
+    ax.scatter([], [], c='cyan', s=120, marker='*', edgecolors='darkcyan',
+               linewidths=0.5, label=f'After shift ({len(post_frontiers)})')
+    ax.scatter([], [], c='#50c850', s=40, marker='s', label='Free')
+    ax.scatter([], [], c='#222222', s=40, marker='s', label='Obstacle')
+    ax.scatter([], [], c='#c8b8e8', s=40, marker='s', label='Unknown')
+    ax.scatter([], [], c='#006600', s=40, marker='o', label='Observing WPs')
+
+    _finalize_plot(fig, ax,
+                   f'Shift to Safe \u2014 {n_shifted} shifted, '
+                   f'{len(post_frontiers)} survived',
+                   os.path.join(out_dir, 'step3_shifted.png'))
+
+
+def plot_step4_selected(frontier_id, wids, sel_frontiers, sel_gains,
+                        dropped, coverage_frac, out_dir):
     """Plot selected vs unselected frontiers after set-cover."""
     fig = plt.figure(figsize=(24, 20))
     ax  = fig.add_subplot(111)
@@ -454,8 +550,8 @@ def plot_step3_selected(frontier_id, wids, sel_frontiers, sel_gains,
 
     n_sel = len(sel_frontiers)
     _finalize_plot(fig, ax,
-                   f'{n_sel} selected (coverage target=0.65)',
-                   os.path.join(out_dir, 'step3_selected.png'))
+                   f'{n_sel} selected (coverage target={coverage_frac})',
+                   os.path.join(out_dir, 'step4_selected.png'))
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -468,7 +564,7 @@ def main():
     ap.add_argument('--frontier-id', type=int, required=True)
     ap.add_argument('--gain-checkpoint', type=str, required=True)
     ap.add_argument('--out-dir', type=str, default=None)
-    ap.add_argument('--coverage-frac', type=float, default=0.65)
+    ap.add_argument('--coverage-frac', type=float, default=0.40)
     ap.add_argument('--proximity-disq-m', type=float, default=2.0)
     ap.add_argument('--round', type=int, default=1)
     args = ap.parse_args()
@@ -545,6 +641,22 @@ def main():
     plot_step2_scored(args.frontier_id, wids, candidates, A0_frontiers,
                       A0_gains, n_zero, out_dir)
 
+    # ── Phase 3b: Shift to safe green ─────────────────────────────────────
+    t3b = time.time()
+    print("[geo] Phase 3b: Shift to safe green ...")
+    pre_shift_frontiers = list(A0_frontiers)  # save for plot arrows
+    (A0_frontiers, A0_gains, A0_connects, A0_masks,
+     A0_pred_maps) = shift_to_safe(
+        A0_frontiers, A0_gains, A0_connects, A0_masks, A0_pred_maps,
+        covered_g2c, wp_positions, gain_model, device, wp_data_cache)
+    timings['Shift to safe'] = (time.time() - t3b,
+                                f'{len(A0_frontiers)} survived')
+
+    # ── Step 3 plot (shift) ───────────────────────────────────────────────
+    print("[geo] Plotting step 3 (shift) ...")
+    plot_step3_shifted(args.frontier_id, wids, pre_shift_frontiers,
+                       A0_frontiers, A0_gains, out_dir)
+
     # ── Phase 4: Greedy set-cover ─────────────────────────────────────────
     t4 = time.time()
     print("[geo] Phase 4: Greedy set-cover ...")
@@ -556,10 +668,10 @@ def main():
     timings['Greedy set-cover'] = (time.time() - t4,
                                    f'{len(sel_frontiers)} selected')
 
-    # ── Step 3 plot ───────────────────────────────────────────────────────
-    print("[geo] Plotting step 3 ...")
-    plot_step3_selected(args.frontier_id, wids, sel_frontiers, sel_gains,
-                        dropped, out_dir)
+    # ── Step 4 plot ───────────────────────────────────────────────────────
+    print("[geo] Plotting step 4 ...")
+    plot_step4_selected(args.frontier_id, wids, sel_frontiers, sel_gains,
+                        dropped, args.coverage_frac, out_dir)
 
     # ── Save results ──────────────────────────────────────────────────────
     print("[geo] Saving results ...")
