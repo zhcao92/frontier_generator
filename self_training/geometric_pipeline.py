@@ -182,8 +182,14 @@ def greedy_set_cover(A0_frontiers, A0_gains, A0_connects, A0_masks,
                      A0_pred_maps, coverage_frac=0.65, proximity_disq_m=2.0):
     """Select frontiers via greedy set-cover over opinion sets.
 
+    Runs greedy selection to exhaustion (for analysis), then applies
+    coverage_frac cutoff for the actual output.
+
     Returns (sel_frontiers, sel_gains, sel_connects, sel_masks, sel_sources,
-             dropped, weights).
+             dropped, weights, cover_curve).
+
+    cover_curve: list of (pick_number, marginal_gain, cumulative_coverage_frac)
+                 for the full exhaustive run — used for analysis plotting.
     """
     # Build opinion sets
     opinion_sets = []
@@ -199,13 +205,15 @@ def greedy_set_cover(A0_frontiers, A0_gains, A0_connects, A0_masks,
     print(f"    {n_universe} (cell, label) pairs in universe")
 
     if n_universe == 0:
-        return [], [], [], [], [], [], []
+        return [], [], [], [], [], [], [], []
 
-    # Greedy selection
+    # Greedy selection — run to exhaustion
     disq_r2 = proximity_disq_m * proximity_disq_m
     covered = set()
-    selected_idx = []
+    all_selected_idx = []
     candidates_set = set(range(len(A0_frontiers)))
+    cover_curve = []       # (pick#, marginal_gain, cumul_frac)
+    cutoff_idx = None      # index into all_selected_idx where coverage_frac is reached
 
     while candidates_set:
         best_idx = -1
@@ -218,7 +226,7 @@ def greedy_set_cover(A0_frontiers, A0_gains, A0_connects, A0_masks,
         if best_idx < 0 or best_gain == 0:
             break
 
-        selected_idx.append(best_idx)
+        all_selected_idx.append(best_idx)
         candidates_set.discard(best_idx)
         covered |= opinion_sets[best_idx]
 
@@ -226,7 +234,7 @@ def greedy_set_cover(A0_frontiers, A0_gains, A0_connects, A0_masks,
         too_close = set()
         for i in candidates_set:
             cx, cy = A0_frontiers[i][0], A0_frontiers[i][1]
-            for si in selected_idx:
+            for si in all_selected_idx:
                 dx = cx - A0_frontiers[si][0]
                 dy = cy - A0_frontiers[si][1]
                 if dx * dx + dy * dy <= disq_r2:
@@ -235,15 +243,24 @@ def greedy_set_cover(A0_frontiers, A0_gains, A0_connects, A0_masks,
         candidates_set -= too_close
 
         frac = len(covered) / n_universe
-        print(f"      pick #{len(selected_idx)}: A0[{best_idx}]  "
+        cover_curve.append((len(all_selected_idx), best_gain, frac))
+        print(f"      pick #{len(all_selected_idx)}: A0[{best_idx}]  "
               f"+{best_gain} opinions  coverage={frac:.3f}  "
               f"disqualified={len(too_close)}")
-        if frac >= coverage_frac:
-            break
 
-    print(f"    Selected {len(selected_idx)}/{len(A0_frontiers)} frontiers  "
-          f"(coverage={len(covered)}/{n_universe} "
-          f"= {len(covered)/n_universe:.3f})")
+        if cutoff_idx is None and frac >= coverage_frac:
+            cutoff_idx = len(all_selected_idx)
+
+    if cutoff_idx is None:
+        cutoff_idx = len(all_selected_idx)
+
+    print(f"    Exhaustive: {len(all_selected_idx)} total picks, "
+          f"cutoff at {cutoff_idx} (coverage_frac={coverage_frac})")
+
+    # Apply cutoff for actual selection
+    selected_idx = all_selected_idx[:cutoff_idx]
+
+    print(f"    Selected {len(selected_idx)}/{len(A0_frontiers)} frontiers")
 
     # Build dropped list
     selected_set = set(selected_idx)
@@ -279,7 +296,7 @@ def greedy_set_cover(A0_frontiers, A0_gains, A0_connects, A0_masks,
         q = delta_final / (delta_final + KAPPA)
         weights.append(float(max(Q_MIN, min(1.0, q))))
 
-    return frontiers, gains, connects, masks, sources, dropped, weights
+    return frontiers, gains, connects, masks, sources, dropped, weights, cover_curve
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -481,6 +498,57 @@ def plot_step2b_shifted(frontier_id, wids, pre_positions, candidates, out_dir):
                    os.path.join(out_dir, 'step2b_shifted.png'))
 
 
+def plot_cover_curve(cover_curve, coverage_frac, out_dir):
+    """Plot marginal gain and cumulative coverage vs. pick number."""
+    if not cover_curve:
+        return
+    picks     = [c[0] for c in cover_curve]
+    marginals = [c[1] for c in cover_curve]
+    cum_fracs = [c[2] for c in cover_curve]
+
+    fig, ax1 = plt.subplots(figsize=(12, 6))
+
+    # Left axis: marginal gain (bar chart)
+    color1 = 'steelblue'
+    ax1.bar(picks, marginals, color=color1, alpha=0.7, label='Marginal gain')
+    ax1.set_xlabel('Pick #', fontsize=12)
+    ax1.set_ylabel('Marginal gain (opinions)', fontsize=12, color=color1)
+    ax1.tick_params(axis='y', labelcolor=color1)
+
+    # Right axis: cumulative coverage (line)
+    ax2 = ax1.twinx()
+    color2 = 'red'
+    ax2.plot(picks, cum_fracs, color=color2, linewidth=2, marker='o',
+             markersize=4, label='Cumulative coverage')
+    ax2.set_ylabel('Cumulative coverage fraction', fontsize=12, color=color2)
+    ax2.tick_params(axis='y', labelcolor=color2)
+    ax2.set_ylim(0, 1.05)
+
+    # Draw cutoff line
+    ax2.axhline(y=coverage_frac, color='red', linestyle='--', alpha=0.5,
+                label=f'Cutoff = {coverage_frac}')
+    # Find and mark cutoff pick
+    for p, f in zip(picks, cum_fracs):
+        if f >= coverage_frac:
+            ax1.axvline(x=p, color='red', linestyle='--', alpha=0.5)
+            break
+
+    # Combined legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=10)
+
+    ax1.set_title('Greedy Set-Cover: Marginal Gain & Cumulative Coverage',
+                  fontsize=14)
+    ax1.grid(True, alpha=0.3, axis='y')
+
+    out_path = os.path.join(out_dir, 'cover_curve.png')
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved: {out_path}")
+
+
 def plot_step4_selected(frontier_id, wids, sel_frontiers, sel_gains,
                         dropped, coverage_frac, out_dir):
     """Plot selected vs unselected frontiers after set-cover."""
@@ -626,12 +694,16 @@ def main():
     t4 = time.time()
     print("[geo] Phase 4: Greedy set-cover ...")
     (sel_frontiers, sel_gains, sel_connects, sel_masks,
-     sel_sources, dropped, sel_weights) = greedy_set_cover(
+     sel_sources, dropped, sel_weights, cover_curve) = greedy_set_cover(
         A0_frontiers, A0_gains, A0_connects, A0_masks, A0_pred_maps,
         coverage_frac=args.coverage_frac,
         proximity_disq_m=args.proximity_disq_m)
     timings['Greedy set-cover'] = (time.time() - t4,
                                    f'{len(sel_frontiers)} selected')
+
+    # ── Coverage curve plot ───────────────────────────────────────────────
+    print("[geo] Plotting coverage curve ...")
+    plot_cover_curve(cover_curve, args.coverage_frac, out_dir)
 
     # ── Step 4 plot ───────────────────────────────────────────────────────
     print("[geo] Plotting step 4 ...")
