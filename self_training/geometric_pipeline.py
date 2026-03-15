@@ -16,6 +16,9 @@ Usage:
 import os, sys, json, math, argparse, time
 from pathlib import Path
 
+# Ensure project root is on sys.path (so `models.*` / `visualization.*` resolve)
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import numpy as np
 import torch
 
