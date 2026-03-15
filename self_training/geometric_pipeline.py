@@ -30,15 +30,17 @@ import matplotlib.patheffects as pe
 # ── shared imports ──────────────────────────────────────────────────────────
 from models.frontier_gain_model import (
     load_atlas, get_current_map_mask,
-    build_atlas_grid, build_coverage_grid,
-    RESOLUTION, CELL_AREA,
+    build_atlas_grid, build_coverage_grid, build_sample,
+    RESOLUTION, CELL_AREA, HALF_EXTENT, GRID_SIZE,
     _build_model as _build_gain_model, _get_device,
 )
 from models.map_utils import load_frontier_data
 from self_training.frontier_refine import (
     predict_gain_with_mask, _load_wp_data, save_round_results,
     _eroded_green, _shift_to_green,
+    bev_upper_mask_to_world_cells,
     KAPPA, Q_MIN, SHIFT_RADIUS_CELLS, WALL_MARGIN_CELLS,
+    UPPER_HALF,
 )
 from visualization import plot_predictions as _bp
 
@@ -143,6 +145,141 @@ def score_candidates(candidates, covered_g2c, wp_positions, gain_model,
     return A0_frontiers, A0_gains, A0_connects, A0_masks, A0_pred_maps, n_zero
 
 
+def score_candidates_batched(candidates, covered_g2c, wp_positions, gain_model,
+                              device, wp_data_cache, batch_size=64):
+    """Score candidates with UNet gain model using batched inference.
+
+    Same semantics as score_candidates but ~3-5x faster:
+    - atlas grid computed once (not per candidate)
+    - model forward pass in chunks of batch_size
+
+    Returns (A0_frontiers, A0_gains, A0_connects, A0_masks, A0_pred_maps, n_zero).
+    """
+    import math as _math
+
+    # Pre-compute atlas grid once
+    atlas_cat, gx_min, gy_min = build_atlas_grid(covered_g2c)
+    atlas_cov = (atlas_cat >= 0)
+    atlas_gmin = (gx_min, gy_min)
+
+    # Build all inputs on CPU
+    valid_indices = []   # index into candidates
+    inputs = []          # numpy arrays (8, 100, 100)
+    thetas = []          # angles for post-processing
+    wp_ids = []          # wp_id per valid candidate
+
+    for idx, cand in enumerate(candidates):
+        wp_id = int(cand[3])
+        if wp_id not in wp_positions:
+            continue
+        wp_pos = wp_positions[wp_id]
+
+        # Load WP data (cached)
+        if wp_data_cache is not None and wp_id in wp_data_cache:
+            wp_data = wp_data_cache[wp_id]
+        else:
+            try:
+                wp_data = _load_wp_data(wp_id)
+            except Exception:
+                continue
+            if wp_data_cache is not None:
+                wp_data_cache[wp_id] = wp_data
+
+        frontier_xy = np.asarray(cand[:2], dtype=np.float64)
+        theta = _math.atan2(frontier_xy[1] - wp_pos[1],
+                            frontier_xy[0] - wp_pos[0])
+        try:
+            inp, _ = build_sample(frontier_xy, theta,
+                                  atlas_cat, atlas_cov, atlas_gmin,
+                                  wp_data=wp_data)
+        except Exception:
+            continue
+
+        valid_indices.append(idx)
+        inputs.append(inp)
+        thetas.append(theta)
+        wp_ids.append(wp_id)
+
+    if not inputs:
+        return [], [], [], [], [], len(candidates)
+
+    # Batched forward pass
+    all_probs = []
+    for start in range(0, len(inputs), batch_size):
+        chunk = inputs[start:start + batch_size]
+        batch_t = torch.from_numpy(
+            np.stack(chunk).astype(np.float32)).to(device)
+        with torch.no_grad():
+            logits = gain_model(batch_t)
+            probs = torch.softmax(logits, dim=1).cpu().numpy()
+        all_probs.append(probs)
+        if (start + batch_size) % 200 < batch_size or start + batch_size >= len(inputs):
+            print(f"    batched scoring {min(start + batch_size, len(inputs))}"
+                  f"/{len(inputs)} ...")
+
+    all_probs = np.concatenate(all_probs, axis=0)  # (N, C, H, W)
+
+    # Post-process
+    A0_frontiers = []
+    A0_gains = []
+    A0_connects = []
+    A0_masks = []
+    A0_pred_maps = []
+    n_zero = 0
+    _H = UPPER_HALF
+
+    for i, (ci, theta, inp) in enumerate(zip(valid_indices, thetas, inputs)):
+        cand = candidates[ci]
+        probs = all_probs[i]
+        free_prob = probs[0]
+        frontier_xy = np.asarray(cand[:2], dtype=np.float64)
+
+        # Gain: upper half only
+        new_free_upper = ((free_prob[:_H, :] > 0.5) & (inp[3, :_H, :] > 0))
+        gain_m2 = float(new_free_upper.sum() * CELL_AREA)
+
+        if gain_m2 <= 0:
+            n_zero += 1
+            continue
+
+        connects = bool(new_free_upper[0, :].any())
+
+        # Overlap mask: full BEV
+        new_free_full = ((free_prob > 0.5) & (inp[3] > 0))
+        cells = bev_upper_mask_to_world_cells(new_free_full, frontier_xy, theta)
+
+        # Extended: cell_preds for set-cover opinion sets
+        argmax_map = np.argmax(probs, axis=0)
+        unobs_mask = inp[3] > 0
+        rows_u, cols_u = np.where(unobs_mask)
+        cos_t = _math.cos(theta)
+        sin_t = _math.sin(theta)
+        fx, fy = float(frontier_xy[0]), float(frontier_xy[1])
+        cell_preds = {}
+        for r, c in zip(rows_u, cols_u):
+            rx = HALF_EXTENT - (r + 0.5) * RESOLUTION
+            ry = (c + 0.5) * RESOLUTION - HALF_EXTENT
+            wx = fx + rx * cos_t - ry * sin_t
+            wy = fy + rx * sin_t + ry * cos_t
+            key = (int(round(wx / RESOLUTION)), int(round(wy / RESOLUTION)))
+            cls = int(argmax_map[r, c])
+            pf = float(probs[0, r, c])
+            po = float(probs[1, r, c])
+            mp = max(pf, po)
+            if key not in cell_preds or mp > max(cell_preds[key][1], cell_preds[key][2]):
+                cell_preds[key] = (cls, pf, po)
+
+        A0_frontiers.append(cand)
+        A0_gains.append(gain_m2)
+        A0_connects.append(connects)
+        A0_masks.append(cells)
+        A0_pred_maps.append(cell_preds)
+
+    n_zero += (len(candidates) - len(valid_indices))  # invalid wp candidates
+
+    return A0_frontiers, A0_gains, A0_connects, A0_masks, A0_pred_maps, n_zero
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 2b. Shift candidates to safe green regions (before scoring)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -186,10 +323,11 @@ def greedy_set_cover(A0_frontiers, A0_gains, A0_connects, A0_masks,
     coverage_frac cutoff for the actual output.
 
     Returns (sel_frontiers, sel_gains, sel_connects, sel_masks, sel_sources,
-             dropped, weights, cover_curve).
+             dropped, weights, cover_curve, all_selected_idx).
 
     cover_curve: list of (pick_number, marginal_gain, cumulative_coverage_frac)
                  for the full exhaustive run — used for analysis plotting.
+    all_selected_idx: full exhaustive selection order (indices into A0_*).
     """
     # Build opinion sets
     opinion_sets = []
@@ -205,7 +343,7 @@ def greedy_set_cover(A0_frontiers, A0_gains, A0_connects, A0_masks,
     print(f"    {n_universe} (cell, label) pairs in universe")
 
     if n_universe == 0:
-        return [], [], [], [], [], [], [], []
+        return [], [], [], [], [], [], [], [], []
 
     # Greedy selection — run to exhaustion
     disq_r2 = proximity_disq_m * proximity_disq_m
@@ -296,7 +434,7 @@ def greedy_set_cover(A0_frontiers, A0_gains, A0_connects, A0_masks,
         q = delta_final / (delta_final + KAPPA)
         weights.append(float(max(Q_MIN, min(1.0, q))))
 
-    return frontiers, gains, connects, masks, sources, dropped, weights, cover_curve
+    return frontiers, gains, connects, masks, sources, dropped, weights, cover_curve, all_selected_idx
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -694,7 +832,7 @@ def main():
     t4 = time.time()
     print("[geo] Phase 4: Greedy set-cover ...")
     (sel_frontiers, sel_gains, sel_connects, sel_masks,
-     sel_sources, dropped, sel_weights, cover_curve) = greedy_set_cover(
+     sel_sources, dropped, sel_weights, cover_curve, _) = greedy_set_cover(
         A0_frontiers, A0_gains, A0_connects, A0_masks, A0_pred_maps,
         coverage_frac=args.coverage_frac,
         proximity_disq_m=args.proximity_disq_m)
