@@ -83,6 +83,16 @@ def process_step(fid, atlas_pts, wp_positions, g2c, gain_model, device,
     # Phase 2b: shift to safe
     candidates, _ = shift_candidates_to_safe(candidates, covered_g2c)
 
+    # Dedup: many boundary cells collapse to the same (x, y, wp_id) after shift
+    seen = set()
+    unique = []
+    for c in candidates:
+        key = (c[0], c[1], int(c[3]))
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+    candidates = unique
+
     # Phase 3: batched UNet scoring
     (A0_frontiers, A0_gains, A0_connects, A0_masks,
      A0_pred_maps, n_zero) = score_candidates_batched(
@@ -100,31 +110,30 @@ def process_step(fid, atlas_pts, wp_positions, g2c, gain_model, device,
         coverage_frac=1.0,
         proximity_disq_m=proximity_disq_m)
 
-    # Build output
-    candidates_out = []
-    for i, (f, g, c) in enumerate(zip(A0_frontiers, A0_gains, A0_connects)):
-        candidates_out.append({
-            "idx": i,
-            "x": float(f[0]),
-            "y": float(f[1]),
-            "wp_id": int(f[3]),
-            "gain_m2": float(g),
-            "connects": bool(c),
-        })
-
+    # Build output — only exhaustively selected candidates
     selection_order = []
+    candidates_out = []
     for pick_num, (pick_idx, mg_frac) in enumerate(
             zip(all_selected_idx, cover_curve), 1):
         _, marginal_gain, cum_frac = mg_frac
         f = A0_frontiers[pick_idx]
-        selection_order.append({
-            "pick": pick_num,
-            "candidate_idx": pick_idx,
+        entry = {
+            "idx": pick_num - 1,
             "x": float(f[0]),
             "y": float(f[1]),
             "wp_id": int(f[3]),
             "gain_m2": float(A0_gains[pick_idx]),
             "connects": bool(A0_connects[pick_idx]),
+        }
+        candidates_out.append(entry)
+        selection_order.append({
+            "pick": pick_num,
+            "candidate_idx": pick_num - 1,
+            "x": entry["x"],
+            "y": entry["y"],
+            "wp_id": entry["wp_id"],
+            "gain_m2": entry["gain_m2"],
+            "connects": entry["connects"],
             "marginal_gain": int(marginal_gain),
             "cumulative_frac": float(cum_frac),
         })
