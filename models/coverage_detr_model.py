@@ -28,7 +28,9 @@ import time
 import numpy as np
 
 # Reuse path constants and loader from map_utils
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _this_dir)                    # for map_utils
+sys.path.insert(0, os.path.dirname(_this_dir))   # for models.*
 from map_utils import load_frontier_data, BASE_DIR, DUMP_DIR, FRONTIERS_DIR
 
 # Reuse grid building and BEV construction from frontier_gain_model
