@@ -653,13 +653,15 @@ def cmd_train(args):
         model.train()
         train_loss = 0.0
         train_n = 0
-        for inp, tgt_xy, tgt_sc, n_tgts in train_loader:
+        n_batches = len(train_loader)
+        for step_i, (inp, tgt_xy, tgt_sc, n_tgts) in enumerate(
+                train_loader, 1):
             inp = inp.to(device)
             tgt_xy = tgt_xy.to(device)
             tgt_sc = tgt_sc.to(device)
 
             pred_xy, pred_conf, pred_score = model(inp)
-            loss, _ = hungarian_loss_with_score(
+            loss, ldict = hungarian_loss_with_score(
                 pred_xy, pred_conf, pred_score,
                 tgt_xy, tgt_sc, n_tgts,
                 lambda_score=args.lambda_score)
@@ -671,6 +673,12 @@ def cmd_train(args):
 
             train_loss += loss.item() * inp.size(0)
             train_n += inp.size(0)
+
+            print(f"  E{epoch} [{step_i}/{n_batches}]  "
+                  f"loss={ldict['loss_total']:.4f}  "
+                  f"L1={ldict['loss_l1']:.4f}  "
+                  f"conf={ldict['loss_conf']:.4f}  "
+                  f"score={ldict['loss_score']:.6f}", flush=True)
         train_loss /= max(train_n, 1)
 
         # ── Validate ──
