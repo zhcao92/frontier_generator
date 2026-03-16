@@ -64,13 +64,20 @@ def cmd_prepare(args):
     print(f"  {len(atlas_pts):,} atlas points, {len(wp_positions)} waypoints"
           f", atlas grid {atlas_cat.shape}")
 
-    # Load manifest
+    # Discover step files (manifest.json optional)
     coverage_dir = args.coverage_dir
     manifest_path = os.path.join(coverage_dir, 'manifest.json')
-    with open(manifest_path) as f:
-        manifest = json.load(f)
-
-    fids = sorted(manifest['frontier_ids'])
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        fids = sorted(manifest['frontier_ids'])
+    else:
+        # Scan for step_*.json files directly
+        fids = sorted(
+            int(f.split('_')[1].split('.')[0])
+            for f in os.listdir(coverage_dir)
+            if f.startswith('step_') and f.endswith('.json')
+        )
     if args.min_id is not None:
         fids = [f for f in fids if f >= args.min_id]
     if args.max_id is not None:
