@@ -967,6 +967,7 @@ def cmd_predict(args):
             plt.close()
 
     # ── Greedy selection by predicted score until coverage rate ─────
+    proximity_disq_m = args.proximity_disq_m
     if coverage_rate is not None and all_pred_world:
         pred_arr_full = np.array(all_pred_world)  # (N, 4): x,y,conf,score
         # Re-normalise scores across all predictions so they sum to 1
@@ -976,20 +977,43 @@ def cmd_predict(args):
             norm_scores = raw_scores / score_sum
         else:
             norm_scores = raw_scores
-        # Sort by normalised score descending
+
+        # Greedy selection with proximity disqualification
+        disq_r2 = proximity_disq_m * proximity_disq_m
+        remaining = set(range(len(pred_arr_full)))
+        selected_idx = []
+        cum_score = 0.0
+
+        # Sort order for greedy picking
         order = np.argsort(-norm_scores)
-        cum_score = np.cumsum(norm_scores[order])
-        # Select until cumulative normalised score >= coverage_rate
-        n_select = int(np.searchsorted(cum_score, coverage_rate) + 1)
-        n_select = min(n_select, len(order))
-        selected_idx = order[:n_select]
+        rank = np.empty(len(order), dtype=int)
+        rank[order] = np.arange(len(order))
+
+        while remaining and cum_score < coverage_rate:
+            # Pick highest-scoring remaining candidate
+            best = min(remaining, key=lambda i: rank[i])
+            selected_idx.append(best)
+            remaining.discard(best)
+            cum_score += norm_scores[best]
+
+            # Disqualify nearby remaining candidates
+            bx, by = pred_arr_full[best, 0], pred_arr_full[best, 1]
+            too_close = set()
+            for i in remaining:
+                dx = pred_arr_full[i, 0] - bx
+                dy = pred_arr_full[i, 1] - by
+                if dx * dx + dy * dy <= disq_r2:
+                    too_close.add(i)
+            remaining -= too_close
+
         # Update scores in output to normalised values
         pred_arr_full[:, 3] = norm_scores
         selected = pred_arr_full[selected_idx]
 
-        print(f"\n── Greedy selection (coverage_rate={coverage_rate:.2f}) ──")
-        print(f"  Selected {n_select}/{len(pred_arr_full)} predictions")
-        print(f"  Cumulative normalised score: {cum_score[n_select-1]:.4f}")
+        print(f"\n── Greedy selection (coverage_rate={coverage_rate:.2f}, "
+              f"proximity={proximity_disq_m:.1f}m) ──")
+        print(f"  Selected {len(selected_idx)}/{len(pred_arr_full)} predictions")
+        print(f"  Cumulative normalised score: {cum_score:.4f}")
 
         # Replace all_pred_world with selected subset for plotting
         all_pred_world_selected = selected.tolist()
@@ -1126,6 +1150,9 @@ def main():
     p.add_argument('--coverage-rate', type=float, default=None,
                    help='Greedy select predictions by score until '
                         'cumulative score >= this value (e.g. 0.8)')
+    p.add_argument('--proximity-disq-m', type=float, default=2.0,
+                   help='Disqualify unselected predictions within this '
+                        'distance (m) of a selected one (default: 2.0)')
     p.add_argument('--no-wp-plots', action='store_true',
                    help='Skip per-WP BEV visualisation (summary map only)')
 
