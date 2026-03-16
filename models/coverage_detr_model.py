@@ -436,6 +436,7 @@ def hungarian_loss_with_score(pred_xy, pred_conf, pred_score,
     total_conf = torch.tensor(0.0, device=device)
     total_score = torch.tensor(0.0, device=device)
     n_matched = 0
+    n_pos_samples = 0  # samples with nt > 0 (for score loss normalisation)
 
     for b in range(B):
         nt = int(n_targets[b]) if not isinstance(n_targets, int) else n_targets
@@ -450,10 +451,7 @@ def hungarian_loss_with_score(pred_xy, pred_conf, pred_score,
                 pred_conf[b],
                 torch.zeros(Q, device=device),
                 reduction='sum')
-            # Score: all targets are 0, uniform softmax is the target
-            score_target = torch.zeros(Q, device=device)
-            total_score = total_score + F.mse_loss(
-                pred_score_norm, score_target, reduction='sum')
+            # No score loss for negative samples
             continue
 
         gt = target_xy[b, :nt]
@@ -483,19 +481,26 @@ def hungarian_loss_with_score(pred_xy, pred_conf, pred_score,
         total_conf = total_conf + F.binary_cross_entropy_with_logits(
             pred_conf[b], conf_target, reduction='sum')
 
-        # Score loss: MSE(softmax(pred), GT norm opinion) over all queries
+        # Score loss: re-normalise GT opinions within this WP so they sum to 1
+        # (matches softmax which also sums to 1 over Q queries)
+        wp_opinion_sum = gt_opinions.sum()
+        if wp_opinion_sum > 0:
+            gt_opinions_wp = gt_opinions / wp_opinion_sum
+        else:
+            gt_opinions_wp = gt_opinions
         score_target = torch.zeros(Q, device=device)
-        score_target[row_ind] = gt_opinions
+        score_target[row_ind] = gt_opinions_wp
         total_score = total_score + F.mse_loss(
             pred_score_norm, score_target, reduction='sum')
 
         n_matched += nt
+        n_pos_samples += 1
 
     # Normalise
     n_total = max(n_matched, 1)
     loss_l1 = lambda_l1 * total_l1 / n_total
     loss_conf = lambda_conf * total_conf / B
-    loss_score = lambda_score * total_score / B
+    loss_score = lambda_score * total_score / max(n_pos_samples, 1)
     total_loss = loss_l1 + loss_conf + loss_score
 
     return total_loss, {
