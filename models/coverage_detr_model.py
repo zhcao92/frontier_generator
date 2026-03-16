@@ -823,32 +823,47 @@ def cmd_predict(args):
           f"Predictions (row,col,conf,score)")
     print("-" * 80)
 
-    for wp_idx, wp_id in enumerate(wids):
-        if wp_id not in wp_positions:
-            continue
+    # ── Build all BEV inputs first ───────────────────────────────────
+    valid_wids = [w for w in wids if w in wp_positions]
+    all_inps = []
+    all_centers = []
+    theta = 0.0  # no rotation at inference
+
+    print(f"Building {len(valid_wids)} BEV grids ...")
+    for wp_id in valid_wids:
         wp_pos = wp_positions[wp_id]
         center_xy = np.array([wp_pos[0], wp_pos[1]])
-        theta = 0.0   # no rotation at inference
-
         inp, _ = build_sample(center_xy, theta,
                               atlas_cat, atlas_cov, atlas_gmin,
                               obs_wp_id=wp_id)
+        all_inps.append(inp)
+        all_centers.append(center_xy)
 
-        inp_t = torch.from_numpy(inp).unsqueeze(0).to(device)
-        with torch.no_grad():
-            pred_xy, pred_conf, pred_score = model(inp_t)
+    # ── Batched model forward pass ───────────────────────────────────
+    import torch.nn.functional as _F
+    inp_batch = torch.from_numpy(np.stack(all_inps)).to(device)
+    print(f"Running batched inference ({inp_batch.shape[0]} samples) ...")
+    with torch.no_grad():
+        pred_xy_all, pred_conf_all, pred_score_all = model(inp_batch)
 
-        pred_xy_np = pred_xy[0].cpu().numpy()
-        conf_np = torch.sigmoid(pred_conf[0]).cpu().numpy()
-        # Softmax over all queries → normalised opinion scores
-        import torch.nn.functional as _F
-        score_norm_np = _F.softmax(pred_score[0], dim=0).cpu().numpy()
+    pred_xy_np = pred_xy_all.cpu().numpy()
+    conf_np = torch.sigmoid(pred_conf_all).cpu().numpy()
+    score_norm_np = _F.softmax(pred_score_all, dim=1).cpu().numpy()
+
+    # ── Process results per WP ───────────────────────────────────────
+    for wp_idx, wp_id in enumerate(valid_wids):
+        center_xy = all_centers[wp_idx]
+        inp = all_inps[wp_idx]
+
+        pxy = pred_xy_np[wp_idx]
+        cnf = conf_np[wp_idx]
+        snm = score_norm_np[wp_idx]
 
         # Confidence-filtered predictions
-        mask = conf_np > conf_thresh
-        preds_bev = pred_xy_np[mask]
-        confs = conf_np[mask]
-        scores_norm = score_norm_np[mask]
+        mask = cnf > conf_thresh
+        preds_bev = pxy[mask]
+        confs = cnf[mask]
+        scores_norm = snm[mask]
 
         # GT candidates for this WP
         gt_cands = wp_to_gt.get(wp_id, [])
@@ -947,18 +962,27 @@ def cmd_predict(args):
     # ── Greedy selection by predicted score until coverage rate ─────
     if coverage_rate is not None and all_pred_world:
         pred_arr_full = np.array(all_pred_world)  # (N, 4): x,y,conf,score
-        # Sort by predicted normalised score descending
-        order = np.argsort(-pred_arr_full[:, 3])
-        cum_score = np.cumsum(pred_arr_full[order, 3])
-        # Select until cumulative score >= coverage_rate
+        # Re-normalise scores across all predictions so they sum to 1
+        raw_scores = pred_arr_full[:, 3].copy()
+        score_sum = raw_scores.sum()
+        if score_sum > 0:
+            norm_scores = raw_scores / score_sum
+        else:
+            norm_scores = raw_scores
+        # Sort by normalised score descending
+        order = np.argsort(-norm_scores)
+        cum_score = np.cumsum(norm_scores[order])
+        # Select until cumulative normalised score >= coverage_rate
         n_select = int(np.searchsorted(cum_score, coverage_rate) + 1)
         n_select = min(n_select, len(order))
         selected_idx = order[:n_select]
+        # Update scores in output to normalised values
+        pred_arr_full[:, 3] = norm_scores
         selected = pred_arr_full[selected_idx]
 
         print(f"\n── Greedy selection (coverage_rate={coverage_rate:.2f}) ──")
         print(f"  Selected {n_select}/{len(pred_arr_full)} predictions")
-        print(f"  Cumulative score: {cum_score[n_select-1]:.4f}")
+        print(f"  Cumulative normalised score: {cum_score[n_select-1]:.4f}")
 
         # Replace all_pred_world with selected subset for plotting
         all_pred_world_selected = selected.tolist()
