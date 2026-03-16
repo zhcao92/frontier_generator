@@ -882,68 +882,67 @@ def cmd_predict(args):
               f"{pred_str}")
 
         # ── Per-WP BEV figure (3 panels) ──────────────────────────────
-        vis = _bev_vis(inp)
-        WC = GRID_SIZE // 2
+        if not args.no_wp_plots:
+            vis = _bev_vis(inp)
+            WC = GRID_SIZE // 2
 
-        fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+            fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-        # Panel 0 – input + depth
-        axes[0].imshow(vis)
-        axes[0].scatter(WC, WC, c='orange', s=150, marker='*',
-                        edgecolors='white', linewidths=1.5, zorder=5)
-        n_hit = int((inp[4] > 0).sum())
-        n_pass = int((inp[5] > 0).sum())
-        axes[0].set_title(f'Input+Depth  hit={n_hit} pass={n_pass}')
+            # Panel 0 – input + depth
+            axes[0].imshow(vis)
+            axes[0].scatter(WC, WC, c='orange', s=150, marker='*',
+                            edgecolors='white', linewidths=1.5, zorder=5)
+            n_hit = int((inp[4] > 0).sum())
+            n_pass = int((inp[5] > 0).sum())
+            axes[0].set_title(f'Input+Depth  hit={n_hit} pass={n_pass}')
 
-        # Panel 1 – input + GT candidates (sized by norm opinion)
-        axes[1].imshow(vis)
-        axes[1].scatter(WC, WC, c='orange', s=150, marker='*',
-                        edgecolors='white', linewidths=1.5, zorder=5)
-        if len(gt_bev):
-            gt_valid = ((gt_bev[:, 0] >= 0) & (gt_bev[:, 0] <= 1) &
-                        (gt_bev[:, 1] >= 0) & (gt_bev[:, 1] <= 1))
-            gv = gt_bev[gt_valid] * GRID_SIZE
-            go = gt_opinions[gt_valid] if len(gt_opinions) else np.array([])
-            # Size by normalised opinion: min 40, scale up
-            gt_sizes = 40 + np.clip(go, 0, 1) * 300 if len(go) else 40
-            axes[1].scatter(gv[:, 1], gv[:, 0], c='lime', s=gt_sizes,
-                            marker='s', edgecolors='darkgreen',
-                            linewidths=1.5, zorder=6)
-        n_gt_label = len(gt_cands) if gt_candidates is not None else '?'
-        axes[1].set_title(f'+ GT candidates ({n_gt_label})')
+            # Panel 1 – input + GT candidates (sized by norm opinion)
+            axes[1].imshow(vis)
+            axes[1].scatter(WC, WC, c='orange', s=150, marker='*',
+                            edgecolors='white', linewidths=1.5, zorder=5)
+            if len(gt_bev):
+                gt_valid = ((gt_bev[:, 0] >= 0) & (gt_bev[:, 0] <= 1) &
+                            (gt_bev[:, 1] >= 0) & (gt_bev[:, 1] <= 1))
+                gv = gt_bev[gt_valid] * GRID_SIZE
+                go = gt_opinions[gt_valid] if len(gt_opinions) else np.array([])
+                gt_sizes = 40 + np.clip(go, 0, 1) * 300 if len(go) else 40
+                axes[1].scatter(gv[:, 1], gv[:, 0], c='lime', s=gt_sizes,
+                                marker='s', edgecolors='darkgreen',
+                                linewidths=1.5, zorder=6)
+            n_gt_label = len(gt_cands) if gt_candidates is not None else '?'
+            axes[1].set_title(f'+ GT candidates ({n_gt_label})')
 
-        # Panel 2 – input + predictions (sized by norm score, annotated)
-        axes[2].imshow(vis)
-        axes[2].scatter(WC, WC, c='orange', s=150, marker='*',
-                        edgecolors='white', linewidths=1.5, zorder=5)
-        if len(preds_bev):
-            pv = preds_bev * GRID_SIZE
-            # Size by predicted normalised score
-            pred_sizes = 40 + np.clip(scores_norm, 0, 1) * 300
-            axes[2].scatter(pv[:, 1], pv[:, 0], c='red', s=pred_sizes,
-                            marker='o', edgecolors='darkred',
-                            linewidths=1, alpha=0.85, zorder=6)
-            for k in range(len(preds_bev)):
-                axes[2].annotate(
-                    f'{confs[k]:.2f}/{scores_norm[k]:.3f}',
-                    (pv[k, 1], pv[k, 0]),
-                    textcoords='offset points', xytext=(4, 4),
-                    fontsize=6, color='white')
-        axes[2].set_title(
-            f'+ Predictions ({len(preds_bev)}, conf>{conf_thresh})')
+            # Panel 2 – input + predictions (sized by norm score, annotated)
+            axes[2].imshow(vis)
+            axes[2].scatter(WC, WC, c='orange', s=150, marker='*',
+                            edgecolors='white', linewidths=1.5, zorder=5)
+            if len(preds_bev):
+                pv = preds_bev * GRID_SIZE
+                pred_sizes = 40 + np.clip(scores_norm, 0, 1) * 300
+                axes[2].scatter(pv[:, 1], pv[:, 0], c='red', s=pred_sizes,
+                                marker='o', edgecolors='darkred',
+                                linewidths=1, alpha=0.85, zorder=6)
+                for k in range(len(preds_bev)):
+                    axes[2].annotate(
+                        f'{confs[k]:.2f}/{scores_norm[k]:.3f}',
+                        (pv[k, 1], pv[k, 0]),
+                        textcoords='offset points', xytext=(4, 4),
+                        fontsize=6, color='white')
+            axes[2].set_title(
+                f'+ Predictions ({len(preds_bev)}, conf>{conf_thresh})')
 
-        for ax in axes:
-            ax.set_xticks([])
-            ax.set_yticks([])
+            for ax in axes:
+                ax.set_xticks([])
+                ax.set_yticks([])
 
-        plt.suptitle(
-            f'CovDETR — Frontier {fid} / WP {wp_id}  '
-            f'(#{wp_idx+1}/{len(wids)})',
-            fontsize=11)
-        plt.tight_layout()
-        plt.savefig(os.path.join(out_dir, f'WP_{wp_id}.png'),
-                    dpi=120, bbox_inches='tight')
-        plt.close()
+            plt.suptitle(
+                f'CovDETR — Frontier {fid} / WP {wp_id}  '
+                f'(#{wp_idx+1}/{len(wids)})',
+                fontsize=11)
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, f'WP_{wp_id}.png'),
+                        dpi=120, bbox_inches='tight')
+            plt.close()
 
     # ── Greedy selection by predicted score until coverage rate ─────
     if coverage_rate is not None and all_pred_world:
@@ -1096,6 +1095,8 @@ def main():
     p.add_argument('--coverage-rate', type=float, default=None,
                    help='Greedy select predictions by score until '
                         'cumulative score >= this value (e.g. 0.8)')
+    p.add_argument('--no-wp-plots', action='store_true',
+                   help='Skip per-WP BEV visualisation (summary map only)')
 
     args = parser.parse_args()
     if args.command == 'prepare':
