@@ -638,7 +638,7 @@ def cmd_train(args):
     optimizer = torch.optim.AdamW([
         {'params': backbone_params, 'lr': args.lr * 0.1},
         {'params': other_params, 'lr': args.lr},
-    ], weight_decay=1e-4)
+    ], weight_decay=args.weight_decay)
 
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs)
@@ -1053,6 +1053,7 @@ def main():
     p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--split-id', type=int, default=1500)
     p.add_argument('--lambda-score', type=float, default=LAMBDA_SCORE)
+    p.add_argument('--weight-decay', type=float, default=1e-4)
     p.add_argument('--save-every', type=int, default=50)
     p.add_argument('--min-id', type=int, default=None,
                    help='Min frontier ID for training (inclusive)')
