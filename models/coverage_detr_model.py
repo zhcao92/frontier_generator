@@ -788,10 +788,12 @@ def cmd_predict(args):
         else:
             print(f"No coverage data for frontier {fid}, running without GT")
 
-    out_dir = os.path.join(BASE_DIR, f"predict_cov_detr_{fid}")
+    results_dir = os.path.join(os.path.dirname(BASE_DIR), 'results')
+    out_dir = os.path.join(results_dir, f"predict_cov_detr_{fid}")
     os.makedirs(out_dir, exist_ok=True)
 
     conf_thresh = 0.3
+    coverage_rate = args.coverage_rate
 
     # Collect all predictions and GT in world coords (for summary map)
     all_pred_world = []    # [(x, y, conf, norm_score), ...]
@@ -943,6 +945,27 @@ def cmd_predict(args):
                     dpi=120, bbox_inches='tight')
         plt.close()
 
+    # ── Greedy selection by predicted score until coverage rate ─────
+    if coverage_rate is not None and all_pred_world:
+        pred_arr_full = np.array(all_pred_world)  # (N, 4): x,y,conf,score
+        # Sort by predicted normalised score descending
+        order = np.argsort(-pred_arr_full[:, 3])
+        cum_score = np.cumsum(pred_arr_full[order, 3])
+        # Select until cumulative score >= coverage_rate
+        n_select = int(np.searchsorted(cum_score, coverage_rate) + 1)
+        n_select = min(n_select, len(order))
+        selected_idx = order[:n_select]
+        selected = pred_arr_full[selected_idx]
+
+        print(f"\n── Greedy selection (coverage_rate={coverage_rate:.2f}) ──")
+        print(f"  Selected {n_select}/{len(pred_arr_full)} predictions")
+        print(f"  Cumulative score: {cum_score[n_select-1]:.4f}")
+
+        # Replace all_pred_world with selected subset for plotting
+        all_pred_world_selected = selected.tolist()
+    else:
+        all_pred_world_selected = all_pred_world
+
     # ── Summary atlas map ────────────────────────────────────────────
     atlas_vis = np.ones((*atlas_cat.shape, 3), dtype=np.float32) * 0.94
     covered = atlas_cov.astype(bool)
@@ -987,8 +1010,8 @@ def cmd_predict(args):
                    zorder=5, label=f'GT candidates ({len(gt_uniq)})')
 
     # Predicted candidates (sized by norm score, alpha by confidence)
-    if all_pred_world:
-        pred_arr = np.array(all_pred_world)  # (N, 4): x, y, conf, norm_score
+    if all_pred_world_selected:
+        pred_arr = np.array(all_pred_world_selected)  # (N, 4): x,y,conf,score
         pred_sizes = 20 + np.clip(pred_arr[:, 3], 0, 1) * 200
         ax.scatter(pred_arr[:, 0], pred_arr[:, 1],
                    c='red', s=pred_sizes, marker='o',
@@ -1008,9 +1031,11 @@ def cmd_predict(args):
 
     n_gt_u = len(set(tuple(g[:2]) for g in all_gt_world)) \
         if all_gt_world else 0
+    n_shown = len(all_pred_world_selected)
+    cov_str = f', cov={coverage_rate:.0%}' if coverage_rate else ''
     ax.set_title(
         f'CovDETR Frontier Prediction — Step {fid}  '
-        f'({len(wids)} WPs, GT={n_gt_u}, Pred={len(all_pred_world)})',
+        f'({len(wids)} WPs, GT={n_gt_u}, Pred={n_shown}{cov_str})',
         fontsize=12)
     ax.legend(loc='best', fontsize=9)
     ax.set_xlabel('X (m)')
@@ -1023,6 +1048,8 @@ def cmd_predict(args):
     print()
     print(f"GT candidates (unique): {n_gt_u}")
     print(f"Predictions total:      {len(all_pred_world)}")
+    if coverage_rate is not None:
+        print(f"Selected (cov={coverage_rate:.0%}): {len(all_pred_world_selected)}")
     print(f"Saved to {out_dir}/")
 
 
@@ -1066,6 +1093,9 @@ def main():
     p.add_argument('--checkpoint', required=True)
     p.add_argument('--coverage-dir', default=None,
                    help='Coverage dataset dir for GT overlay (optional)')
+    p.add_argument('--coverage-rate', type=float, default=None,
+                   help='Greedy select predictions by score until '
+                        'cumulative score >= this value (e.g. 0.8)')
 
     args = parser.parse_args()
     if args.command == 'prepare':
