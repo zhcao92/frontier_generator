@@ -859,11 +859,15 @@ def cmd_predict(args):
         cnf = conf_np[wp_idx]
         snm = score_norm_np[wp_idx]
 
+        # WP weight: number of unobserved cells in BEV (channel 3)
+        wp_weight = float((inp[3] > 0).sum())
+
         # Confidence-filtered predictions
         mask = cnf > conf_thresh
         preds_bev = pxy[mask]
         confs = cnf[mask]
-        scores_norm = snm[mask]
+        # Weight local scores by WP importance
+        scores_weighted = snm[mask] * wp_weight
 
         # GT candidates for this WP
         gt_cands = wp_to_gt.get(wp_id, [])
@@ -882,7 +886,7 @@ def cmd_predict(args):
             world_xy = bev_normalized_to_world(preds_bev, center_xy, theta)
             for i in range(len(world_xy)):
                 all_pred_world.append([world_xy[i, 0], world_xy[i, 1],
-                                       confs[i], scores_norm[i]])
+                                       confs[i], scores_weighted[i]])
 
         for i, xy in enumerate(gt_xy):
             g = gt_opinions[i] if i < len(gt_opinions) else 0.0
@@ -890,8 +894,8 @@ def cmd_predict(args):
 
         # Console summary
         pred_str = '  '.join(
-            f'({r:.2f},{c:.2f},{conf:.2f},{sc:.3f})'
-            for (r, c), conf, sc in zip(preds_bev, confs, scores_norm)
+            f'({r:.2f},{c:.2f},{conf:.2f},{sc:.1f})'
+            for (r, c), conf, sc in zip(preds_bev, confs, scores_weighted)
         ) if len(preds_bev) else '—'
         print(f"{wp_id:>6}  {len(gt_cands):>4}  {len(preds_bev):>5}  "
               f"{pred_str}")
@@ -927,24 +931,27 @@ def cmd_predict(args):
             n_gt_label = len(gt_cands) if gt_candidates is not None else '?'
             axes[1].set_title(f'+ GT candidates ({n_gt_label})')
 
-            # Panel 2 – input + predictions (sized by norm score, annotated)
+            # Panel 2 – input + predictions (sized by weighted score, annotated)
             axes[2].imshow(vis)
             axes[2].scatter(WC, WC, c='orange', s=150, marker='*',
                             edgecolors='white', linewidths=1.5, zorder=5)
             if len(preds_bev):
                 pv = preds_bev * GRID_SIZE
-                pred_sizes = 40 + np.clip(scores_norm, 0, 1) * 300
+                # Normalise weighted scores for sizing within this WP
+                sw_max = scores_weighted.max() if scores_weighted.max() > 0 else 1
+                pred_sizes = 40 + np.clip(scores_weighted / sw_max, 0, 1) * 300
                 axes[2].scatter(pv[:, 1], pv[:, 0], c='red', s=pred_sizes,
                                 marker='o', edgecolors='darkred',
                                 linewidths=1, alpha=0.85, zorder=6)
                 for k in range(len(preds_bev)):
                     axes[2].annotate(
-                        f'{confs[k]:.2f}/{scores_norm[k]:.3f}',
+                        f'{confs[k]:.2f}/{scores_weighted[k]:.1f}',
                         (pv[k, 1], pv[k, 0]),
                         textcoords='offset points', xytext=(4, 4),
                         fontsize=6, color='white')
             axes[2].set_title(
-                f'+ Predictions ({len(preds_bev)}, conf>{conf_thresh})')
+                f'+ Preds ({len(preds_bev)}, conf>{conf_thresh}, '
+                f'wt={wp_weight:.0f})')
 
             for ax in axes:
                 ax.set_xticks([])

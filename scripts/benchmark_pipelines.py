@@ -168,12 +168,14 @@ def benchmark_detr(frontier_id, detr_checkpoint, wids, wp_positions,
     for wi, wp_id in enumerate(valid_wids):
         wp_pos = wp_positions[wp_id]
         center_xy = np.array([wp_pos[0], wp_pos[1]])
+        inp = all_inps[wi]
+        wp_weight = float((inp[3] > 0).sum())
         mask = conf_np[wi] > conf_thresh
         if not mask.any():
             continue
         preds_bev = pred_xy_np[wi][mask]
         confs = conf_np[wi][mask]
-        scores = score_norm_np[wi][mask]
+        scores = score_norm_np[wi][mask] * wp_weight
         world_xy = bev_normalized_to_world(preds_bev, center_xy, theta)
         for i in range(len(world_xy)):
             all_preds.append([world_xy[i, 0], world_xy[i, 1],
